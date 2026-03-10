@@ -178,6 +178,27 @@ class SQLiteDB:
             ).fetchone()
         return row[0] if row else 0
 
+    def reset_stale_processing(self) -> list[str]:
+        """Reset any videos stuck in PROCESSING state back to UPLOADED.
+        
+        This handles recovery from interrupted processing (e.g., server crash).
+        Returns list of video IDs that were reset.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM videos WHERE status = ?",
+                (VideoStatus.PROCESSING.value,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    "UPDATE videos SET status = ?, error_message = ? WHERE status = ?",
+                    (VideoStatus.UPLOADED.value, "Reset after server restart", VideoStatus.PROCESSING.value),
+                )
+        reset_ids = [r[0] for r in rows]
+        if reset_ids:
+            logger.warning("Reset %d stale PROCESSING videos: %s", len(reset_ids), reset_ids)
+        return reset_ids
+
     def event_count(self, video_id: str) -> int:
         """Count events for a video."""
         with self._connect() as conn:

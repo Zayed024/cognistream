@@ -1,23 +1,34 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { VideoMeta } from "../types";
-import { listVideos, processVideo, deleteVideo } from "../api/client";
+import { listVideos, processVideo, deleteVideo, subscribeToProgress, type VideoProgress } from "../api/client";
 
 interface VideoListProps {
   onSelectVideo: (video: VideoMeta) => void;
   onUploadClick: () => void;
+  refreshTrigger?: number;
 }
 
-export default function VideoList({ onSelectVideo, onUploadClick }: VideoListProps) {
+export default function VideoList({ onSelectVideo, onUploadClick, refreshTrigger }: VideoListProps) {
   const [videos, setVideos] = useState<VideoMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
+  const [progressMap, setProgressMap] = useState<Map<string, VideoProgress>>(new Map());
+  
+  // Track active SSE subscriptions
+  const subscriptionsRef = useRef<Map<string, () => void>>(new Map());
 
   const fetchVideos = useCallback(async () => {
     try {
       const data = await listVideos();
       setVideos(data);
       setError(null);
+      
+      // Update processingIds based on actual status
+      const currentlyProcessing = new Set(
+        data.filter((v) => v.status === "PROCESSING").map((v) => v.video_id)
+      );
+      setProcessingIds(currentlyProcessing);
     } catch (err) {
       setError("Failed to load videos");
       console.error(err);
@@ -26,12 +37,65 @@ export default function VideoList({ onSelectVideo, onUploadClick }: VideoListPro
     }
   }, []);
 
+  // Subscribe to SSE for processing videos
+  useEffect(() => {
+    const processingVideos = videos.filter((v) => v.status === "PROCESSING");
+    const currentSubs = subscriptionsRef.current;
+    
+    // Subscribe to new processing videos
+    for (const video of processingVideos) {
+      if (!currentSubs.has(video.video_id)) {
+        const unsubscribe = subscribeToProgress(
+          video.video_id,
+          (progress) => {
+            setProgressMap((prev) => {
+              const next = new Map(prev);
+              next.set(video.video_id, progress);
+              return next;
+            });
+            
+            // When done, refresh the video list
+            if (progress.done) {
+              currentSubs.delete(video.video_id);
+              fetchVideos();
+            }
+          },
+          () => {
+            // On error, remove subscription and refresh
+            currentSubs.delete(video.video_id);
+            fetchVideos();
+          }
+        );
+        currentSubs.set(video.video_id, unsubscribe);
+      }
+    }
+    
+    // Cleanup subscriptions for videos no longer processing
+    for (const [videoId, unsubscribe] of currentSubs) {
+      const stillProcessing = processingVideos.some((v) => v.video_id === videoId);
+      if (!stillProcessing) {
+        unsubscribe();
+        currentSubs.delete(videoId);
+      }
+    }
+  }, [videos, fetchVideos]);
+
+  // Cleanup all subscriptions on unmount
+  useEffect(() => {
+    return () => {
+      for (const unsubscribe of subscriptionsRef.current.values()) {
+        unsubscribe();
+      }
+      subscriptionsRef.current.clear();
+    };
+  }, []);
+
   useEffect(() => {
     fetchVideos();
-    // Poll for status updates every 5 seconds
-    const interval = setInterval(fetchVideos, 5000);
+    // Poll for status updates every 10 seconds (reduced from 5s since we have SSE)
+    const interval = setInterval(fetchVideos, 10000);
     return () => clearInterval(interval);
-  }, [fetchVideos]);
+  }, [fetchVideos, refreshTrigger]);
 
   const handleProcess = async (videoId: string) => {
     try {
@@ -108,6 +172,7 @@ export default function VideoList({ onSelectVideo, onUploadClick }: VideoListPro
               key={video.video_id}
               video={video}
               isProcessing={processingIds.has(video.video_id) || video.status === "PROCESSING"}
+              progress={progressMap.get(video.video_id)}
               onSelect={() => onSelectVideo(video)}
               onProcess={() => handleProcess(video.video_id)}
               onDelete={() => handleDelete(video.video_id, video.filename)}
@@ -124,12 +189,14 @@ export default function VideoList({ onSelectVideo, onUploadClick }: VideoListPro
 function VideoCard({
   video,
   isProcessing,
+  progress,
   onSelect,
   onProcess,
   onDelete,
 }: {
   video: VideoMeta;
   isProcessing: boolean;
+  progress?: VideoProgress;
   onSelect: () => void;
   onProcess: () => void;
   onDelete: () => void;
@@ -153,8 +220,20 @@ function VideoCard({
         </svg>
         {isProcessing && (
           <div style={styles.processingOverlay}>
-            <div style={styles.spinnerSmall} />
-            <span style={styles.processingText}>Processing...</span>
+            <div style={styles.progressContainer}>
+              <div style={styles.progressTrack}>
+                <div
+                  style={{
+                    ...styles.progressFill,
+                    width: `${progress?.percent ?? 0}%`,
+                  }}
+                />
+              </div>
+              <span style={styles.progressPercent}>{progress?.percent ?? 0}%</span>
+            </div>
+            <span style={styles.processingText}>
+              {progress?.stage || "Starting..."}
+            </span>
           </div>
         )}
       </div>
@@ -437,5 +516,30 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "14px",
     color: "#94a3b8",
     margin: 0,
+  },
+  progressContainer: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+    width: "80%",
+  },
+  progressTrack: {
+    flex: 1,
+    height: "6px",
+    background: "rgba(255,255,255,0.2)",
+    borderRadius: "3px",
+    overflow: "hidden",
+  },
+  progressFill: {
+    height: "100%",
+    background: "#3b82f6",
+    borderRadius: "3px",
+    transition: "width 0.3s ease",
+  },
+  progressPercent: {
+    color: "#fff",
+    fontSize: "14px",
+    fontWeight: 600,
+    minWidth: "36px",
   },
 };

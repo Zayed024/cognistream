@@ -19,6 +19,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import shutil
 import threading
@@ -27,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.config import (
@@ -41,19 +43,39 @@ from backend.db.models import VideoStatus
 from backend.db.sqlite import SQLiteDB
 from backend.fusion.multimodal_embedder import MultimodalEmbedder
 from backend.ingestion.loader import VideoLoadError, VideoLoader
-from backend.pipeline.orchestrator import PipelineOrchestrator
+from backend.pipeline.orchestrator import PipelineOrchestrator, PipelineProgress
 from backend.retrieval.query_engine import QueryEngine
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# ── Progress tracking (in-memory, single-instance edge deployment) ──
+_progress_store: dict[str, PipelineProgress] = {}
+_progress_events: dict[str, asyncio.Event] = {}
+_progress_lock = threading.Lock()
+
+
+def _on_progress(progress: PipelineProgress) -> None:
+    """Callback to store progress updates from the orchestrator."""
+    with _progress_lock:
+        _progress_store[progress.video_id] = progress
+        # Signal any waiting SSE clients
+        if progress.video_id in _progress_events:
+            # Schedule the event set in the event loop
+            try:
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(_progress_events[progress.video_id].set)
+            except RuntimeError:
+                pass  # No event loop running
+
+
 # ── Shared singletons (created once, reused across requests) ──
 _db = SQLiteDB()
 _store = ChromaStore()
 _embedder = MultimodalEmbedder()
 _query_engine = QueryEngine(embedder=_embedder, store=_store)
-_orchestrator = PipelineOrchestrator(db=_db, store=_store)
+_orchestrator = PipelineOrchestrator(db=_db, store=_store, on_progress=_on_progress)
 _loader = VideoLoader()
 
 # Maximum allowed top_k to prevent ChromaDB abuse
@@ -189,6 +211,97 @@ async def process_video(req: ProcessRequest):
         "status": "PROCESSING",
         "message": "Processing started.",
     }
+
+
+@router.get("/video/{video_id}/progress")
+async def get_progress(video_id: str):
+    """Get processing progress for a video."""
+    progress = _progress_store.get(video_id)
+    if progress is None:
+        meta = _db.get_video(video_id)
+        if meta is None:
+            raise HTTPException(404, f"Video not found: {video_id}")
+        # Not processing or already done
+        return {
+            "video_id": video_id,
+            "stage": meta.status.value,
+            "stage_number": 10 if meta.status == VideoStatus.PROCESSED else 0,
+            "total_stages": 10,
+            "percent": 100 if meta.status == VideoStatus.PROCESSED else 0,
+        }
+
+    return {
+        "video_id": progress.video_id,
+        "stage": progress.stage,
+        "stage_number": progress.stage_number,
+        "total_stages": progress.total_stages,
+        "percent": round((progress.stage_number / progress.total_stages) * 100),
+        "elapsed_sec": progress.elapsed_sec,
+    }
+
+
+@router.get("/video/{video_id}/progress/stream")
+async def stream_progress(video_id: str):
+    """Stream processing progress via Server-Sent Events (SSE).
+    
+    Much more efficient than polling - client receives updates in real-time.
+    """
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    async def event_generator():
+        # Create an event for this video
+        event = asyncio.Event()
+        _progress_events[video_id] = event
+        last_stage = -1
+        
+        try:
+            while True:
+                # Check current status
+                progress = _progress_store.get(video_id)
+                current_meta = _db.get_video(video_id)
+                
+                if current_meta is None:
+                    # Video was deleted
+                    yield f"data: {json.dumps({'done': True, 'deleted': True})}\n\n"
+                    break
+                
+                if current_meta.status == VideoStatus.PROCESSED:
+                    yield f"data: {json.dumps({'video_id': video_id, 'stage': 'Complete', 'stage_number': 10, 'total_stages': 10, 'percent': 100, 'done': True})}\n\n"
+                    break
+                
+                if current_meta.status == VideoStatus.FAILED:
+                    yield f"data: {json.dumps({'video_id': video_id, 'stage': 'Failed', 'percent': 0, 'done': True, 'error': True})}\n\n"
+                    break
+                
+                if progress and progress.stage_number != last_stage:
+                    last_stage = progress.stage_number
+                    yield f"data: {json.dumps({'video_id': progress.video_id, 'stage': progress.stage, 'stage_number': progress.stage_number, 'total_stages': progress.total_stages, 'percent': round((progress.stage_number / progress.total_stages) * 100), 'elapsed_sec': progress.elapsed_sec})}\n\n"
+                
+                # Wait for next update or timeout after 2 seconds
+                event.clear()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            # Server shutting down or client disconnected
+            return
+        finally:
+            # Cleanup
+            _progress_events.pop(video_id, None)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

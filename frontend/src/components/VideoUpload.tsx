@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback } from "react";
-import { uploadVideo, processVideo } from "../api/client";
+import { uploadVideo } from "../api/client";
 
 interface VideoUploadProps {
-  onComplete: () => void;
+  onComplete: (videoId: string, shouldProcess: boolean) => void;
   onCancel: () => void;
 }
 
@@ -76,13 +76,9 @@ export default function VideoUpload({ onComplete, onCancel }: VideoUploadProps) 
 
     try {
       const result = await uploadVideo(file, setProgress);
-      
-      if (autoProcess) {
-        setProgress(100);
-        await processVideo(result.video_id);
-      }
-      
-      onComplete();
+      setProgress(100);
+      // Pass video_id and autoProcess to parent - parent handles processing
+      onComplete(result.video_id, autoProcess);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Upload failed";
       setError(message);

@@ -64,3 +64,50 @@ export async function processVideo(videoId: string): Promise<void> {
 export async function deleteVideo(videoId: string): Promise<void> {
   await api.delete(`/video/${videoId}`);
 }
+
+/** Video processing progress */
+export interface VideoProgress {
+  video_id: string;
+  stage: string;
+  stage_number: number;
+  total_stages: number;
+  percent: number;
+  elapsed_sec?: number;
+  done?: boolean;
+  error?: boolean;
+}
+
+/** Get processing progress for a video */
+export async function getVideoProgress(videoId: string): Promise<VideoProgress> {
+  const { data } = await api.get<VideoProgress>(`/video/${videoId}/progress`);
+  return data;
+}
+
+/** Subscribe to progress updates via Server-Sent Events */
+export function subscribeToProgress(
+  videoId: string,
+  onProgress: (progress: VideoProgress) => void,
+  onError?: (error: Event) => void
+): () => void {
+  const eventSource = new EventSource(`/api/video/${videoId}/progress/stream`);
+  
+  eventSource.onmessage = (event) => {
+    try {
+      const progress = JSON.parse(event.data) as VideoProgress;
+      onProgress(progress);
+      if (progress.done) {
+        eventSource.close();
+      }
+    } catch (e) {
+      console.error("Failed to parse progress event:", e);
+    }
+  };
+  
+  eventSource.onerror = (error) => {
+    onError?.(error);
+    eventSource.close();
+  };
+  
+  // Return cleanup function
+  return () => eventSource.close();
+}

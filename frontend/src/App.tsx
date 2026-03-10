@@ -7,7 +7,7 @@ import VideoList from "./components/VideoList";
 import VideoUpload from "./components/VideoUpload";
 import { useSearch } from "./hooks/useSearch";
 import { useVideo } from "./hooks/useVideo";
-import { getVideoStreamUrl } from "./api/client";
+import { getVideoStreamUrl, processVideo } from "./api/client";
 import type { VideoMeta } from "./types";
 
 type View = "list" | "search";
@@ -81,8 +81,19 @@ export default function App() {
     clear();
   }, [clear]);
 
-  const handleUploadComplete = useCallback(() => {
+  // Track refresh trigger for VideoList
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+
+  const handleUploadComplete = useCallback((videoId: string, shouldProcess: boolean) => {
     setShowUpload(false);
+    // Trigger refresh so VideoList fetches new video
+    setRefreshTrigger((prev) => prev + 1);
+    // Start processing if requested - fire and forget
+    if (shouldProcess) {
+      processVideo(videoId).catch((err) => {
+        console.error("Failed to start processing:", err);
+      });
+    }
   }, []);
 
   return (
@@ -116,6 +127,7 @@ export default function App() {
         <VideoList
           onSelectVideo={handleSelectVideo}
           onUploadClick={() => setShowUpload(true)}
+          refreshTrigger={refreshTrigger}
         />
       ) : (
         <>
