@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.env
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data directory - all processed/generated files
+data/videos/
+data/audio/
+data/frames/
+data/graphs/
+data/db/
+
+# Model files
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Node/Frontend
+node_modules/
+.npm/
+dist/
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Old/Temp
+cogni/
+*.tmp
+*.temp
