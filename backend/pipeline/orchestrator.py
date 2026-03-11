@@ -184,15 +184,14 @@ class PipelineOrchestrator:
 
             # ── Stage 7: Fusion & embedding ────────────────────
             self._emit(progress, 6, "Multimodal fusion")
+            fused: list = []
             if not captions and not transcripts:
-                msg = "No captions or transcripts — nothing to fuse."
-                logger.error(msg)
-                result.errors.append(msg)
-                self._mark_failed(meta.id, msg)
-                return result
-
-            embedder = MultimodalEmbedder()
-            fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
+                msg = "No captions or transcripts — skipping fusion (video metadata still saved)."
+                logger.warning(msg)
+                result.warnings.append(msg)
+            else:
+                embedder = MultimodalEmbedder()
+                fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
 
             # ── Stage 8: Knowledge graph ───────────────────────
             self._emit(progress, 7, "Knowledge graph")
@@ -209,17 +208,24 @@ class PipelineOrchestrator:
             # Add events as searchable segments
             event_segments = self._events_to_segments(meta.id, events)
             if event_segments:
+                if embedder is None:
+                    embedder = MultimodalEmbedder()
                 embedder.embed(event_segments)
                 fused.extend(event_segments)
 
             # Free embedding model memory
-            embedder.unload_model()
+            if embedder is not None:
+                embedder.unload_model()
 
             # ── Stage 10: Store to ChromaDB ────────────────────
             self._emit(progress, 9, "Storing embeddings")
             # Purge old data for this video (idempotent reprocessing)
             self.store.purge_video(meta.id)
-            result.segments_stored = self.store.add_segments(fused)
+            if fused:
+                result.segments_stored = self.store.add_segments(fused)
+            else:
+                result.segments_stored = 0
+                logger.info("No segments to store — video processed without searchable content.")
 
             # ── Finalise ───────────────────────────────────────
             self._emit(progress, 10, "Complete")

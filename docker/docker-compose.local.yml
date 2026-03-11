@@ -1,51 +1,23 @@
 # ─────────────────────────────────────────────────────────
-# CogniStream — Docker Compose
+# CogniStream — Docker Compose (Local Ollama)
 #
-# Edge deployment simulation: 4 services, 4 CPU / 6 GB RAM
-# total budget.  All models are baked into images at build
-# time — no internet required at runtime.
+# Uses the host machine's Ollama app instead of a container.
+# Only runs ChromaDB, Backend, and Frontend in Docker.
 #
 # Usage:
-#   docker compose -f docker/docker-compose.yml up --build
+#   docker compose -f docker/docker-compose.local.yml up -d
+#
+# Prerequisites:
+#   - Ollama desktop app running on host (port 11434)
+#   - Model pulled:  ollama pull moondream
 #
 # Access:
 #   Frontend:  http://localhost:3000
 #   Backend:   http://localhost:8000
-#   Ollama:    http://localhost:11434
 #   ChromaDB:  http://localhost:8500
 # ─────────────────────────────────────────────────────────
 
 services:
-
-  # ── Ollama (Vision Language Model server) ─────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: cognistream-ollama
-    volumes:
-      - ollama_data:/root/.ollama
-      - ./ollama-entrypoint.sh:/entrypoint.sh:ro
-    entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    environment:
-      - OLLAMA_MODEL=moondream2
-      - OLLAMA_HOST=0.0.0.0
-    ports:
-      - "11434:11434"
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 3G
-        reservations:
-          memory: 1G
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-    networks:
-      - cognistream
 
   # ── ChromaDB (vector database) ────────────────────────
   chromadb:
@@ -63,8 +35,6 @@ services:
         limits:
           cpus: "0.5"
           memory: 512M
-        reservations:
-          memory: 128M
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "chroma", "--version"]
@@ -85,8 +55,8 @@ services:
       - app_data:/app/data
     environment:
       - COGNISTREAM_ROOT=/app
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=moondream2
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=moondream
       - OLLAMA_TIMEOUT=120
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
@@ -98,6 +68,8 @@ services:
       - LOG_LEVEL=INFO
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     deploy:
       resources:
         limits:
@@ -106,8 +78,6 @@ services:
         reservations:
           memory: 512M
     depends_on:
-      ollama:
-        condition: service_healthy
       chromadb:
         condition: service_healthy
     restart: unless-stopped
@@ -133,8 +103,6 @@ services:
         limits:
           cpus: "0.5"
           memory: 256M
-        reservations:
-          memory: 64M
     depends_on:
       - backend
     restart: unless-stopped
@@ -148,19 +116,14 @@ services:
       - cognistream
 
 # ── Volumes ─────────────────────────────────────────────
-# Named volumes persist data across container restarts.
 volumes:
-  ollama_data:
-    driver: local
   chroma_data:
     driver: local
   app_data:
     driver: local
 
 # ── Network ─────────────────────────────────────────────
-# Internal bridge network — containers talk to each other,
-# no external access needed at runtime.
 networks:
   cognistream:
     driver: bridge
-    internal: false  # false so host can reach published ports
+    internal: false

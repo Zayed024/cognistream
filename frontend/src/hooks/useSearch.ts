@@ -7,17 +7,17 @@ interface UseSearchReturn {
   isLoading: boolean;
   error: string | null;
   query: string;
-  search: (query: string, videoId?: string) => Promise<void>;
+  search: (query: string) => Promise<void>;
   clear: () => void;
 }
 
-export function useSearch(): UseSearchReturn {
+export function useSearch(videoId?: string): UseSearchReturn {
   const [results, setResults] = useState<SearchResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
 
-  const search = useCallback(async (q: string, videoId?: string) => {
+  const search = useCallback(async (q: string) => {
     const trimmed = q.trim();
     if (!trimmed) return;
 
@@ -40,7 +40,7 @@ export function useSearch(): UseSearchReturn {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [videoId]);
 
   const clear = useCallback(() => {
     setResults([]);

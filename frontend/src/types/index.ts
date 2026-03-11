@@ -20,13 +20,17 @@ export interface VideoMeta {
   video_id: string;
   filename: string;
   duration_sec: number;
-  fps: number;
-  resolution: string;
+  fps?: number;
+  resolution?: string;
   status: "UPLOADED" | "PROCESSING" | "PROCESSED" | "FAILED";
-  segment_count: number;
-  event_count: number;
+  segment_count?: number;
+  event_count?: number;
   created_at: string;
   processed_at?: string;
+}
+
+export interface VideoListResponse {
+  videos: VideoMeta[];
 }
 
 export interface SearchRequest {
