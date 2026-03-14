@@ -9,6 +9,7 @@ interface UseSearchReturn {
   query: string;
   search: (query: string) => Promise<void>;
   clear: () => void;
+  setResults: (results: SearchResult[]) => void;
 }
 
 export function useSearch(videoId?: string): UseSearchReturn {
@@ -48,5 +49,5 @@ export function useSearch(videoId?: string): UseSearchReturn {
     setError(null);
   }, []);
 
-  return { results, isLoading, error, query, search, clear };
+  return { results, isLoading, error, query, search, clear, setResults };
 }

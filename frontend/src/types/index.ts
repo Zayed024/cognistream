@@ -39,3 +39,48 @@ export interface SearchRequest {
   top_k?: number;
   source_filter?: string;
 }
+
+/** Knowledge graph types */
+export interface GraphNode {
+  id: string;
+  label: string;
+  type: "person" | "vehicle" | "location" | "object";
+  count: number;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  action: string;
+  timestamp: number;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+/** Event timeline types */
+export interface VideoEvent {
+  id: string;
+  video_id: string;
+  event_type: string;
+  start_time: number;
+  end_time: number;
+  description: string;
+  entities: string[];
+}
+
+/** Annotation types */
+export interface Annotation {
+  id: string;
+  video_id: string;
+  start_time: number;
+  end_time: number;
+  label: string;
+  note: string;
+  color: string;
+  created_at: string;
+}

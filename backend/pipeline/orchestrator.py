@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -147,40 +148,50 @@ class PipelineOrchestrator:
             extractor = AudioExtractor()
             audio_result = extractor.extract(meta)
 
-            # ── Stage 5: Visual analysis (skippable) ───────────
-            self._emit(progress, 4, "Visual analysis (VLM)")
+            # ── Stages 5+6: VLM + Whisper (PARALLEL) ──────────
+            self._emit(progress, 4, "Visual + Audio analysis (parallel)")
             captions: list[VisualCaption] = []
-            try:
-                client = OllamaClient()
-                if client.is_available():
-                    runner = VLMRunner(client)
-                    captions = runner.analyse_keyframes(keyframes)
-                else:
-                    msg = "Ollama not available — skipping VLM analysis."
-                    logger.warning(msg)
-                    result.warnings.append(msg)
-            except Exception as exc:
-                msg = f"VLM analysis failed: {exc}"
-                logger.error(msg)
-                result.warnings.append(msg)
-
-            # ── Stage 6: Transcription (skippable) ─────────────
-            self._emit(progress, 5, "Audio transcription")
             transcripts: list[TranscriptSegment] = []
-            if audio_result and not audio_result.is_silent:
+
+            def _run_vlm() -> list[VisualCaption]:
+                try:
+                    client = OllamaClient()
+                    if client.is_available():
+                        runner = VLMRunner(client)
+                        return runner.analyse_keyframes(keyframes)
+                    else:
+                        result.warnings.append("Ollama not available — skipping VLM analysis.")
+                        return []
+                except Exception as exc:
+                    result.warnings.append(f"VLM analysis failed: {exc}")
+                    logger.error("VLM analysis failed: %s", exc)
+                    return []
+
+            def _run_whisper() -> list[TranscriptSegment]:
+                if not audio_result or audio_result.is_silent:
+                    if audio_result and audio_result.is_silent:
+                        result.warnings.append("Audio track is silent — skipping transcription.")
+                    else:
+                        result.warnings.append("No audio stream — skipping transcription.")
+                    return []
                 try:
                     whisper = WhisperRunner()
-                    transcripts = whisper.transcribe(audio_result.audio_path)
-                    # Free Whisper memory before embedding
+                    segs = whisper.transcribe(audio_result.audio_path)
                     whisper.unload_model()
+                    return segs
                 except Exception as exc:
-                    msg = f"Transcription failed: {exc}"
-                    logger.error(msg)
-                    result.warnings.append(msg)
-            elif audio_result and audio_result.is_silent:
-                result.warnings.append("Audio track is silent — skipping transcription.")
-            else:
-                result.warnings.append("No audio stream — skipping transcription.")
+                    result.warnings.append(f"Transcription failed: {exc}")
+                    logger.error("Transcription failed: %s", exc)
+                    return []
+
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline") as pool:
+                vlm_future: Future = pool.submit(_run_vlm)
+                whisper_future: Future = pool.submit(_run_whisper)
+
+                captions = vlm_future.result()
+                self._emit(progress, 5, "Visual analysis complete")
+                transcripts = whisper_future.result()
+                self._emit(progress, 5, "Audio transcription complete")
 
             # ── Stage 7: Fusion & embedding ────────────────────
             self._emit(progress, 6, "Multimodal fusion")

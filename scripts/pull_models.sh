@@ -37,29 +37,29 @@ echo "=== CogniStream Model Setup ==="
 echo "Using Python: $PYTHON"
 echo ""
 
-# 1. Ollama model
-echo "[1/3] Pulling Ollama model: moondream..."
+# 1. Ollama VLM model
+echo "[1/3] Pulling Ollama model: qwen2.5vl:3b..."
 if command -v ollama &> /dev/null; then
-    ollama pull moondream
+    ollama pull qwen2.5vl:3b
     echo "  Done."
 else
     echo "  SKIP: ollama not found. It will be pulled inside Docker."
 fi
 
 # 2. SentenceTransformers embedding model
-echo "[2/3] Downloading SentenceTransformer: all-MiniLM-L6-v2..."
+echo "[2/3] Downloading SentenceTransformer: BAAI/bge-small-en-v1.5..."
 $PYTHON -c "
 from sentence_transformers import SentenceTransformer
-model = SentenceTransformer('all-MiniLM-L6-v2')
+model = SentenceTransformer('BAAI/bge-small-en-v1.5')
 print('  Downloaded to:', model._model_card_vars.get('model_id', 'cache'))
 "
 echo "  Done."
 
 # 3. Faster-Whisper model
-echo "[3/3] Downloading Faster-Whisper: base (int8)..."
+echo "[3/3] Downloading Faster-Whisper: small (int8)..."
 $PYTHON -c "
 from faster_whisper import WhisperModel
-model = WhisperModel('base', device='cpu', compute_type='int8')
+model = WhisperModel('small', device='cpu', compute_type='int8')
 print('  Model loaded successfully.')
 "
 echo "  Done."

@@ -1,19 +1,21 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import type { VideoMeta } from "../types";
-import { listVideos, processVideo, deleteVideo, subscribeToProgress, type VideoProgress } from "../api/client";
+import { listVideos, processVideo, deleteVideo, processBatch, getThumbnailUrl, subscribeToProgress, type VideoProgress } from "../api/client";
 
 interface VideoListProps {
   onSelectVideo: (video: VideoMeta) => void;
   onUploadClick: () => void;
+  onGlobalSearch: () => void;
   refreshTrigger?: number;
 }
 
-export default function VideoList({ onSelectVideo, onUploadClick, refreshTrigger }: VideoListProps) {
+export default function VideoList({ onSelectVideo, onUploadClick, onGlobalSearch, refreshTrigger }: VideoListProps) {
   const [videos, setVideos] = useState<VideoMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
   const [progressMap, setProgressMap] = useState<Map<string, VideoProgress>>(new Map());
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   // Track active SSE subscriptions
   const subscriptionsRef = useRef<Map<string, () => void>>(new Map());
@@ -117,6 +119,27 @@ export default function VideoList({ onSelectVideo, onUploadClick, refreshTrigger
     }
   };
 
+  const toggleSelect = (videoId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(videoId)) next.delete(videoId);
+      else next.add(videoId);
+      return next;
+    });
+  };
+
+  const handleBatchProcess = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    try {
+      await processBatch(ids);
+      setSelectedIds(new Set());
+      fetchVideos();
+    } catch (err) {
+      console.error("Batch process failed:", err);
+    }
+  };
+
   const handleDelete = async (videoId: string, filename: string) => {
     if (!confirm(`Delete "${filename}"? This cannot be undone.`)) return;
     try {
@@ -151,9 +174,22 @@ export default function VideoList({ onSelectVideo, onUploadClick, refreshTrigger
     <div style={styles.container}>
       <div style={styles.header}>
         <h2 style={styles.title}>Videos</h2>
-        <button onClick={onUploadClick} style={styles.uploadBtn}>
-          + Upload Video
-        </button>
+        <div style={styles.headerActions}>
+          {selectedIds.size > 0 && (
+            <button onClick={handleBatchProcess} style={styles.batchBtn}>
+              Process {selectedIds.size} selected
+            </button>
+          )}
+          <button onClick={onGlobalSearch} style={styles.globalSearchBtn}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
+            </svg>
+            Search All
+          </button>
+          <button onClick={onUploadClick} style={styles.uploadBtn}>
+            + Upload Video
+          </button>
+        </div>
       </div>
 
       {videos.length === 0 ? (
@@ -173,6 +209,8 @@ export default function VideoList({ onSelectVideo, onUploadClick, refreshTrigger
               video={video}
               isProcessing={processingIds.has(video.video_id) || video.status === "PROCESSING"}
               progress={progressMap.get(video.video_id)}
+              isSelected={selectedIds.has(video.video_id)}
+              onToggleSelect={() => toggleSelect(video.video_id)}
               onSelect={() => onSelectVideo(video)}
               onProcess={() => handleProcess(video.video_id)}
               onDelete={() => handleDelete(video.video_id, video.filename)}
@@ -190,6 +228,8 @@ function VideoCard({
   video,
   isProcessing,
   progress,
+  isSelected,
+  onToggleSelect,
   onSelect,
   onProcess,
   onDelete,
@@ -197,6 +237,8 @@ function VideoCard({
   video: VideoMeta;
   isProcessing: boolean;
   progress?: VideoProgress;
+  isSelected: boolean;
+  onToggleSelect: () => void;
   onSelect: () => void;
   onProcess: () => void;
   onDelete: () => void;
@@ -204,10 +246,20 @@ function VideoCard({
   const isReady = video.status === "PROCESSED";
   const isFailed = video.status === "FAILED";
   const canProcess = video.status === "UPLOADED" || isFailed;
+  const [thumbError, setThumbError] = useState(false);
 
   return (
-    <div style={styles.card}>
-      {/* Thumbnail placeholder */}
+    <div style={{ ...styles.card, outline: isSelected ? "2px solid #3b82f6" : "none" }}>
+      {/* Selection checkbox */}
+      {canProcess && (
+        <input
+          type="checkbox"
+          checked={isSelected}
+          onChange={onToggleSelect}
+          style={styles.selectCheckbox}
+        />
+      )}
+      {/* Thumbnail */}
       <div
         style={{
           ...styles.thumbnail,
@@ -215,9 +267,18 @@ function VideoCard({
         }}
         onClick={isReady ? onSelect : undefined}
       >
-        <svg style={styles.thumbnailIcon} viewBox="0 0 24 24" fill="currentColor">
-          <polygon points="5,3 19,12 5,21" />
-        </svg>
+        {isReady && !thumbError ? (
+          <img
+            src={getThumbnailUrl(video.video_id)}
+            alt={video.filename}
+            style={styles.thumbnailImg}
+            onError={() => setThumbError(true)}
+          />
+        ) : (
+          <svg style={styles.thumbnailIcon} viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5,3 19,12 5,21" />
+          </svg>
+        )}
         {isProcessing && (
           <div style={styles.processingOverlay}>
             <div style={styles.progressContainer}>
@@ -329,6 +390,11 @@ const styles: Record<string, React.CSSProperties> = {
     margin: 0,
     color: "#1e293b",
   },
+  headerActions: {
+    display: "flex",
+    gap: "8px",
+    alignItems: "center",
+  },
   uploadBtn: {
     background: "#3b82f6",
     color: "#fff",
@@ -341,6 +407,46 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     alignItems: "center",
     gap: "6px",
+  },
+  globalSearchBtn: {
+    background: "#f8fafc",
+    color: "#475569",
+    border: "1px solid #e2e8f0",
+    borderRadius: "8px",
+    padding: "10px 16px",
+    fontSize: "14px",
+    fontWeight: 500,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  },
+  batchBtn: {
+    background: "#22c55e",
+    color: "#fff",
+    border: "none",
+    borderRadius: "8px",
+    padding: "10px 16px",
+    fontSize: "14px",
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  selectCheckbox: {
+    position: "absolute",
+    top: "8px",
+    left: "8px",
+    zIndex: 3,
+    width: "16px",
+    height: "16px",
+    cursor: "pointer",
+  },
+  thumbnailImg: {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+    position: "absolute",
+    top: 0,
+    left: 0,
   },
   grid: {
     display: "grid",

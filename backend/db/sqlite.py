@@ -65,8 +65,20 @@ CREATE TABLE IF NOT EXISTS events (
     created_at  TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_segments_video ON segments(video_id);
-CREATE INDEX IF NOT EXISTS idx_events_video   ON events(video_id);
+CREATE TABLE IF NOT EXISTS annotations (
+    id          TEXT PRIMARY KEY,
+    video_id    TEXT NOT NULL REFERENCES videos(id),
+    start_time  REAL NOT NULL,
+    end_time    REAL NOT NULL,
+    label       TEXT NOT NULL,
+    note        TEXT DEFAULT '',
+    color       TEXT DEFAULT '#3b82f6',
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_segments_video     ON segments(video_id);
+CREATE INDEX IF NOT EXISTS idx_events_video       ON events(video_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_video  ON annotations(video_id);
 """
 
 
@@ -207,6 +219,61 @@ class SQLiteDB:
                 (video_id,),
             ).fetchone()
         return row[0] if row else 0
+
+    # ── events ───────────────────────────────────────────────────
+
+    def list_events(self, video_id: str) -> list[dict]:
+        """Return all events for a video, sorted by start_time."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE video_id = ? ORDER BY start_time",
+                (video_id,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "video_id": r["video_id"],
+                "event_type": r["event_type"],
+                "start_time": r["start_time"],
+                "end_time": r["end_time"],
+                "description": r["description"],
+                "entities": r["entities"].split(",") if r["entities"] else [],
+            }
+            for r in rows
+        ]
+
+    # ── annotations ──────────────────────────────────────────────
+
+    def save_annotation(self, ann: dict) -> None:
+        """Insert or replace an annotation."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO annotations
+                   (id, video_id, start_time, end_time, label, note, color, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    ann["id"], ann["video_id"], ann["start_time"], ann["end_time"],
+                    ann["label"], ann.get("note", ""), ann.get("color", "#3b82f6"),
+                    ann["created_at"],
+                ),
+            )
+
+    def list_annotations(self, video_id: str) -> list[dict]:
+        """Return all annotations for a video, sorted by start_time."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM annotations WHERE video_id = ? ORDER BY start_time",
+                (video_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_annotation(self, annotation_id: str) -> bool:
+        """Delete a single annotation. Returns True if deleted."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM annotations WHERE id = ?", (annotation_id,),
+            )
+        return cursor.rowcount > 0
 
     # ── helpers ─────────────────────────────────────────────────
 
