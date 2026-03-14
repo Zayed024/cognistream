@@ -214,6 +214,12 @@ class LiveStopRequest(BaseModel):
     video_id: str
 
 
+# ── Browser camera chunk management ──
+# Tracks browser-based camera feeds where chunks arrive via HTTP upload
+_browser_feeds: dict[str, dict] = {}  # video_id → {chunk_idx, embedder, captions, transcripts}
+_browser_feeds_lock = threading.Lock()
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Health
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -991,6 +997,271 @@ async def live_websocket(websocket: WebSocket, video_id: str):
                 clients.discard(websocket)
                 if not clients:
                     del _ws_clients[video_id]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Browser camera feed (phone / screen share via getUserMedia)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.post("/live/browser-chunk", status_code=200)
+async def upload_browser_chunk(
+    video_id: str = Query(...),
+    chunk_index: int = Query(...),
+    chunk_start: float = Query(0),
+    file: UploadFile = File(...),
+):
+    """Receive a video chunk from a browser-based camera (phone, webcam, screen share).
+
+    The frontend captures via getUserMedia / getDisplayMedia, encodes chunks
+    using MediaRecorder, and POSTs each chunk here.  The backend saves the
+    chunk to disk, extracts keyframes, runs VLM + Whisper, and indexes it.
+
+    This enables phone cameras and screen shares without needing RTSP.
+    """
+    import tempfile
+    import cv2 as _cv2
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    from backend.pipeline.streaming import StreamingPipeline
+
+    # Save uploaded chunk to temp file
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        tmp_path = tmp.name
+        content = await file.read()
+        tmp.write(content)
+
+    try:
+        # Initialize or retrieve feed state
+        with _browser_feeds_lock:
+            if video_id not in _browser_feeds:
+                _browser_feeds[video_id] = {
+                    "chunk_idx": 0,
+                    "embedder": MultimodalEmbedder(),
+                    "all_captions": [],
+                    "all_transcripts": [],
+                }
+            feed = _browser_feeds[video_id]
+
+        # WebM from MediaRecorder may not be seekable. Convert to mp4 via
+        # FFmpeg first so OpenCV can reliably extract frames.
+        mp4_path = tmp_path.replace(".webm", ".mp4")
+        convert_cmd = [
+            str(FFMPEG_PATH), "-y", "-i", tmp_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-c:a", "aac", "-b:a", "64k",
+            "-movflags", "+faststart",
+            mp4_path,
+        ]
+        convert_result = subprocess.run(convert_cmd, capture_output=True, timeout=60)
+        if convert_result.returncode == 0 and Path(mp4_path).stat().st_size > 500:
+            video_chunk_path = mp4_path
+        else:
+            # Fallback: try the raw webm
+            video_chunk_path = tmp_path
+            mp4_path = None
+            logger.warning("FFmpeg webm→mp4 conversion failed, using raw webm")
+
+        # Extract keyframes from the chunk video
+        cap = _cv2.VideoCapture(video_chunk_path)
+        if not cap.isOpened():
+            raise HTTPException(400, f"Could not read video chunk {chunk_index}")
+
+        fps = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            # Some containers don't report frame count — read until EOF
+            total_frames = int(fps * 30)  # assume max 30s chunk
+        chunk_dir = FRAME_DIR / video_id / f"browser_{chunk_index:06d}"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        max_kf = 5
+        step = max(1, total_frames // max_kf)
+        keyframes = []
+        from backend.db.models import Keyframe as _Keyframe
+
+        for i in range(0, total_frames, step):
+            if len(keyframes) >= max_kf:
+                break
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, i)
+            ret, frame = cap.read()
+            if not ret:
+                if len(keyframes) > 0:
+                    break  # We got some frames, that's enough
+                continue
+            ts = chunk_start + (i / fps)
+            fp = str(chunk_dir / f"frame_{i:06d}.jpg")
+            _cv2.imwrite(fp, frame, [_cv2.IMWRITE_JPEG_QUALITY, 85])
+            keyframes.append(_Keyframe(
+                video_id=video_id,
+                segment_index=chunk_index,
+                frame_number=i,
+                timestamp=round(ts, 3),
+                file_path=fp,
+            ))
+        cap.release()
+
+        # Use the chunk video path for whisper (it has audio)
+        audio_source = video_chunk_path
+
+        # Parallel VLM + Whisper
+        from backend.visual.vlm_runner import OllamaClient as _OC
+        from backend.db.models import FusedSegment as _FusedSegment
+        import uuid as _uuid
+
+        vlm_client = _OC()
+        vlm_available = vlm_client.is_available()
+
+        chunk_duration = total_frames / fps if fps > 0 else 15.0
+
+        def _browser_whisper(src_path: str) -> list:
+            """Extract audio from browser chunk and transcribe."""
+            import tempfile as _tmpmod
+            from backend.audio.whisper_runner import WhisperRunner as _WR
+            from backend.db.models import TranscriptSegment  # noqa: F811
+
+            with _tmpmod.NamedTemporaryFile(suffix=".wav", delete=False) as wav_tmp:
+                wav_path = wav_tmp.name
+            try:
+                # Extract all audio from the chunk (no seeking needed)
+                cmd = [
+                    str(FFMPEG_PATH), "-y", "-i", src_path,
+                    "-vn", "-acodec", "pcm_s16le",
+                    "-ar", "16000", "-ac", "1",
+                    wav_path,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, timeout=60)
+                if proc.returncode != 0:
+                    logger.debug("Browser chunk audio extraction failed: %s",
+                                 proc.stderr.decode(errors="replace")[-200:])
+                    return []
+                if Path(wav_path).stat().st_size < 1000:
+                    return []
+
+                wr = _WR()
+                segs = wr.transcribe(wav_path)
+                wr.unload_model()
+                return segs
+            except Exception as exc:
+                logger.debug("Browser whisper failed: %s", exc)
+                return []
+            finally:
+                Path(wav_path).unlink(missing_ok=True)
+
+        with _TPE(max_workers=2, thread_name_prefix="browser") as pool:
+            vlm_future = pool.submit(
+                StreamingPipeline._vlm_on_keyframes,
+                keyframes,
+                vlm_client if vlm_available else None,
+            )
+            whisper_future = pool.submit(_browser_whisper, audio_source)
+            captions = vlm_future.result()
+            transcripts = whisper_future.result()
+
+        # Offset whisper timestamps
+        for seg in transcripts:
+            seg.start_time = round(seg.start_time + chunk_start, 3)
+            seg.end_time = round(seg.end_time + chunk_start, 3)
+
+        feed["all_captions"].extend(captions)
+        feed["all_transcripts"].extend(transcripts)
+
+        # Fuse + embed + store
+        embedder = feed["embedder"]
+        fused = embedder.fuse(video_id, captions, transcripts)
+
+        logger.info(
+            "Browser chunk %d: %d keyframes, %d captions, %d transcripts, vlm=%s",
+            chunk_index, len(keyframes), len(captions), len(transcripts),
+            "on" if vlm_available else "off",
+        )
+
+        # Fallback: if VLM and Whisper both produced nothing, create a
+        # basic segment per keyframe so the chunk is still searchable.
+        if not fused and keyframes:
+            for kf in keyframes:
+                fused.append(_FusedSegment(
+                    id=_uuid.uuid4().hex,
+                    video_id=video_id,
+                    start_time=kf.timestamp,
+                    end_time=kf.timestamp + chunk_duration / max(len(keyframes), 1),
+                    text=f"Live frame at {kf.timestamp:.1f}s from {video_id}",
+                    source_type="visual",
+                    frame_path=kf.file_path,
+                ))
+
+        segments_stored = 0
+        if fused:
+            embedder.embed(fused)
+            segments_stored = _store.add_segments(fused)
+
+        feed["chunk_idx"] = chunk_index + 1
+
+        # Broadcast via WebSocket if clients connected
+        if _on_live_event:
+            from backend.pipeline.streaming import LiveEvent
+            _on_live_event(LiveEvent(
+                video_id=video_id,
+                event_type="chunk_ready",
+                data={
+                    "chunk_index": chunk_index,
+                    "segments_stored": segments_stored,
+                    "start_time": chunk_start,
+                },
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ))
+
+        return {
+            "video_id": video_id,
+            "chunk_index": chunk_index,
+            "segments_stored": segments_stored,
+            "keyframes_extracted": len(keyframes),
+        }
+
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+        # Clean up converted mp4 if it exists
+        mp4_cleanup = tmp_path.replace(".webm", ".mp4")
+        Path(mp4_cleanup).unlink(missing_ok=True)
+
+
+@router.post("/live/browser-stop")
+async def stop_browser_feed(video_id: str = Query(...)):
+    """Finalize a browser camera feed — build knowledge graph and clean up."""
+    with _browser_feeds_lock:
+        feed = _browser_feeds.pop(video_id, None)
+
+    if feed is None:
+        raise HTTPException(404, f"No browser feed: {video_id}")
+
+    # Build knowledge graph in background
+    captions = feed["all_captions"]
+    transcripts = feed["all_transcripts"]
+    embedder = feed["embedder"]
+
+    if captions or transcripts:
+        from backend.knowledge.graph import KnowledgeGraph
+        from backend.knowledge.event_detector import EventDetector
+
+        kg = KnowledgeGraph(video_id)
+        kg.build_from_captions(captions, transcripts)
+        kg.save()
+
+        detector = EventDetector()
+        events = detector.detect(kg)
+        if events:
+            from backend.pipeline.streaming import StreamingPipeline
+            event_segments = StreamingPipeline._events_to_segments(video_id, events)
+            embedder.embed(event_segments)
+            _store.add_segments(event_segments)
+
+    embedder.unload_model()
+
+    return {
+        "video_id": video_id,
+        "total_chunks": feed["chunk_idx"],
+        "total_captions": len(captions),
+        "total_transcripts": len(transcripts),
+        "message": "Browser feed finalized.",
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

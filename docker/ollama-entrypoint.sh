@@ -7,7 +7,7 @@
 # After pull completes, the model is warm and ready to serve.
 # ─────────────────────────────────────────────────────────
 
-MODEL="${OLLAMA_MODEL:-qwen2.5vl:3b}"
+MODEL="${OLLAMA_MODEL:-moondream}"
 
 echo "[CogniStream] Starting Ollama server..."
 ollama serve &

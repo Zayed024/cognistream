@@ -38,9 +38,9 @@ echo "Using Python: $PYTHON"
 echo ""
 
 # 1. Ollama VLM model
-echo "[1/3] Pulling Ollama model: qwen2.5vl:3b..."
+echo "[1/3] Pulling Ollama model: moondream..."
 if command -v ollama &> /dev/null; then
-    ollama pull qwen2.5vl:3b
+    ollama pull moondream
     echo "  Done."
 else
     echo "  SKIP: ollama not found. It will be pulled inside Docker."

@@ -294,3 +294,31 @@ export function connectLiveWebSocket(
     close: () => ws.close(),
   };
 }
+
+// ── Browser camera (phone / screen share) ───────────────────
+
+export async function uploadBrowserChunk(
+  videoId: string,
+  chunkIndex: number,
+  chunkStart: number,
+  blob: Blob
+): Promise<{ segments_stored: number; keyframes_extracted: number }> {
+  const formData = new FormData();
+  formData.append("file", blob, `chunk_${chunkIndex}.webm`);
+
+  const { data } = await api.post(
+    `/live/browser-chunk?video_id=${encodeURIComponent(videoId)}&chunk_index=${chunkIndex}&chunk_start=${chunkStart}`,
+    formData,
+    { headers: { "Content-Type": "multipart/form-data" }, timeout: 120000 }
+  );
+  return data;
+}
+
+export async function stopBrowserFeed(
+  videoId: string
+): Promise<{ total_chunks: number; message: string }> {
+  const { data } = await api.post(
+    `/live/browser-stop?video_id=${encodeURIComponent(videoId)}`
+  );
+  return data;
+}

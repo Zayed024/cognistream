@@ -528,7 +528,7 @@ class _LiveFeedWorker(threading.Thread):
         self.db = db
         self.store = store
         self._on_live_event = on_live_event
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
         self.status = LiveFeedStatus(
             video_id=video_id,
@@ -544,7 +544,7 @@ class _LiveFeedWorker(threading.Thread):
 
     def stop(self) -> None:
         """Signal the worker to stop after the current chunk."""
-        self._stop.set()
+        self._halt.set()
 
     def get_status(self) -> LiveFeedStatus:
         return self.status
@@ -565,7 +565,7 @@ class _LiveFeedWorker(threading.Thread):
         chunk_idx = 0
         reconnect_attempts = 0
 
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             # ── Open / reconnect to stream ────────────────────
             cap = cv2.VideoCapture(self._capture_source)
             if not cap.isOpened():
@@ -588,7 +588,7 @@ class _LiveFeedWorker(threading.Thread):
                     StreamingPipeline.MAX_RECONNECT_ATTEMPTS,
                     StreamingPipeline.RECONNECT_DELAY_SEC,
                 )
-                self._stop.wait(StreamingPipeline.RECONNECT_DELAY_SEC)
+                self._halt.wait(StreamingPipeline.RECONNECT_DELAY_SEC)
                 continue
 
             # Connection established
@@ -603,7 +603,7 @@ class _LiveFeedWorker(threading.Thread):
 
             # ── Capture loop ──────────────────────────────────
             try:
-                while not self._stop.is_set():
+                while not self._halt.is_set():
                     chunk_start_wall = time.monotonic()
                     chunk_start_sec = chunk_idx * self.chunk_sec
                     chunk_end_sec = chunk_start_sec + self.chunk_sec
@@ -679,7 +679,7 @@ class _LiveFeedWorker(threading.Thread):
                 cap.release()
 
             # If stopped intentionally, don't reconnect
-            if self._stop.is_set():
+            if self._halt.is_set():
                 break
 
             # Otherwise attempt reconnection
@@ -695,7 +695,7 @@ class _LiveFeedWorker(threading.Thread):
                 "state": "reconnecting",
                 "attempt": reconnect_attempts,
             })
-            self._stop.wait(StreamingPipeline.RECONNECT_DELAY_SEC)
+            self._halt.wait(StreamingPipeline.RECONNECT_DELAY_SEC)
 
         # ── Cleanup ───────────────────────────────────────────
         # Final knowledge graph build
@@ -736,7 +736,7 @@ class _LiveFeedWorker(threading.Thread):
         chunk_wall_start = time.monotonic()
 
         while frames_read < total_frames_needed:
-            if self._stop.is_set():
+            if self._halt.is_set():
                 break
 
             ret, frame = cap.read()
