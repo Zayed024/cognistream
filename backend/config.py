@@ -67,12 +67,22 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # Embeddings (Multimodal Fusion)
 # ──────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 384  # local model dimension
+
+# When NVIDIA is enabled, embeddings are 1024-dim (NV-EmbedQA-E5-V5).
+# ChromaDB collections are dimension-locked, so we use a separate
+# collection name to avoid conflicts when switching providers.
+NVIDIA_EMBEDDING_DIM = 1024
 
 # ──────────────────────────────────────────────
 # ChromaDB
 # ──────────────────────────────────────────────
-CHROMA_COLLECTION = "cognistream_segments"
+# Collection name auto-switches when NVIDIA is enabled to avoid dimension conflicts.
+# Local embeddings (384-dim) and NVIDIA embeddings (1024-dim) can't share a collection.
+CHROMA_COLLECTION = os.getenv(
+    "CHROMA_COLLECTION",
+    "cognistream_nvidia" if os.getenv("NVIDIA_API_KEY", "") else "cognistream_segments",
+)
 # When running in Docker, ChromaDB is a separate service.
 # Set CHROMA_HOST to enable HTTP client mode instead of embedded.
 CHROMA_HOST = os.getenv("CHROMA_HOST", "")  # empty = embedded/persistent mode
@@ -100,8 +110,61 @@ MAX_CONCURRENT_JOBS = 1
 #                  "quality" = 4-pass VLM + sequential (original behavior)
 PIPELINE_MODE = os.getenv("PIPELINE_MODE", "fast")
 
+# Number of parallel workers for VLM frame analysis.
+# Local Ollama: keep at 1 (model handles one request at a time).
+# NVIDIA cloud: set to 4-8 for concurrent API calls.
+# Auto ("0") = 1 for local, 4 for NVIDIA cloud.
+VLM_WORKERS = int(os.getenv("VLM_WORKERS", "0"))
+
+# Number of parallel workers for shot detection (splits video into chunks).
+SHOT_DETECTION_WORKERS = int(os.getenv("SHOT_DETECTION_WORKERS", "2"))
+
 # Streaming / live-video chunk size in seconds
 STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
+
+# Live feed segment TTL — auto-delete segments older than this (hours).
+# 0 = keep forever (default for file-based processing).
+LIVE_SEGMENT_TTL_HOURS = int(os.getenv("LIVE_SEGMENT_TTL_HOURS", "24"))
+
+# ──────────────────────────────────────────────
+# NVIDIA NIM Cloud (optional — set API key to enable)
+# When enabled, NVIDIA models are used for higher quality.
+# When disabled (default), local models (Ollama/Whisper) are used.
+# ──────────────────────────────────────────────
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+# Which NVIDIA models to use (only active when NVIDIA_API_KEY is set)
+NVIDIA_VLM_MODEL = os.getenv("NVIDIA_VLM_MODEL", "meta/llama-3.2-11b-vision-instruct")
+NVIDIA_EMBED_MODEL = os.getenv("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+NVIDIA_ASR_MODEL = os.getenv("NVIDIA_ASR_MODEL", "nvidia/parakeet-ctc-1_1b-asr")
+NVIDIA_ASR_FUNCTION_ID = os.getenv("NVIDIA_ASR_FUNCTION_ID", "1598d209-5e27-4d3c-8079-4751568b1081")
+NVIDIA_CLIP_MODEL = os.getenv("NVIDIA_CLIP_MODEL", "nvidia/nvclip-vit-h-14")
+NVIDIA_GROUNDING_MODEL = os.getenv("NVIDIA_GROUNDING_MODEL", "nvidia/nv-grounding-dino")
+NVIDIA_GROUNDING_URL = os.getenv("NVIDIA_GROUNDING_URL", "https://ai.api.nvidia.com/v1/cv/nvidia/nv-grounding-dino")
+
+def is_nvidia_enabled() -> bool:
+    """True if NVIDIA cloud mode is active (API key provided)."""
+    return bool(NVIDIA_API_KEY)
+
+# ──────────────────────────────────────────────
+# Security
+# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Webhooks — notify external systems on events
+# ──────────────────────────────────────────────
+# Comma-separated list of URLs to POST event payloads to.
+# Empty = disabled.  Events: video_processed, event_detected, live_chunk_ready
+WEBHOOK_URLS = [u.strip() for u in os.getenv("WEBHOOK_URLS", "").split(",") if u.strip()]
+
+# Optional API key authentication.  Set to enable — requests must include
+# header "X-API-Key: <key>".  Empty = no auth (default for local dev).
+# Supports multiple comma-separated keys for multi-user setups.
+API_KEY = os.getenv("COGNISTREAM_API_KEY", "")
+API_KEYS: set[str] = {k.strip() for k in API_KEY.split(",") if k.strip()}
+
+# Rate limiting (requests per minute per IP)
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 
 # ──────────────────────────────────────────────
 # Logging

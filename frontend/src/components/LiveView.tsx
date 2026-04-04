@@ -180,11 +180,21 @@ export default function LiveView({ onBack }: LiveViewProps) {
 
           addLog("chunk", `Uploading chunk ${idx} (${(blob.size / 1024).toFixed(0)} KB)...`);
 
-          try {
-            const result = await uploadBrowserChunk(feedId.trim(), idx, startSec, blob);
-            addLog("chunk", `Chunk ${idx}: ${result.segments_stored} segments indexed`);
-          } catch (err) {
-            addLog("error", `Chunk ${idx} upload failed: ${err instanceof Error ? err.message : "unknown"}`);
+          // Retry upload up to 2 times on failure
+          let uploaded = false;
+          for (let attempt = 0; attempt < 3 && !uploaded; attempt++) {
+            try {
+              const result = await uploadBrowserChunk(feedId.trim(), idx, startSec, blob);
+              addLog("chunk", `Chunk ${idx}: ${result.segments_stored} segments indexed`);
+              uploaded = true;
+            } catch (err) {
+              if (attempt < 2) {
+                addLog("info", `Chunk ${idx} retry ${attempt + 1}/2...`);
+                await new Promise((r) => setTimeout(r, 1000));
+              } else {
+                addLog("error", `Chunk ${idx} failed after 3 attempts: ${err instanceof Error ? err.message : "unknown"}`);
+              }
+            }
           }
 
           // Start next chunk (if not stopped)

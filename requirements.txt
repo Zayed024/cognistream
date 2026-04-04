@@ -28,3 +28,7 @@ spacy==3.8.7
 
 # Graph
 networkx==3.4.2
+
+# ── Optional: NVIDIA NIM cloud support ──
+# Uncomment if using NVIDIA cloud models (requires API key)
+# nvidia-riva-client>=2.17.0  # Parakeet ASR (gRPC)

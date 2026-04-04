@@ -8,6 +8,7 @@ import VideoUpload from "./components/VideoUpload";
 import KnowledgeGraph from "./components/KnowledgeGraph";
 import EventTimeline from "./components/EventTimeline";
 import LiveView from "./components/LiveView";
+import StatsPanel from "./components/StatsPanel";
 import { useSearch } from "./hooks/useSearch";
 import { useVideo } from "./hooks/useVideo";
 import { getVideoStreamUrl, processVideo, findSimilar, exportClip } from "./api/client";
@@ -213,12 +214,15 @@ export default function App() {
       {view === "live" ? (
         <LiveView onBack={handleBackToList} />
       ) : view === "list" ? (
+        <>
+        <StatsPanel />
         <VideoList
           onSelectVideo={handleSelectVideo}
           onUploadClick={() => setShowUpload(true)}
           onGlobalSearch={handleGlobalSearch}
           refreshTrigger={refreshTrigger}
         />
+        </>
       ) : view === "global-search" ? (
         <>
           <section style={styles.searchSection}>
@@ -317,7 +321,7 @@ const styles: Record<string, React.CSSProperties> = {
   app: {
     maxWidth: "1280px",
     margin: "0 auto",
-    padding: "24px 32px",
+    padding: "24px clamp(12px, 3vw, 32px)",
     fontFamily:
       '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
     color: "#1e293b",
@@ -328,6 +332,8 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     alignItems: "flex-start",
     justifyContent: "space-between",
+    flexWrap: "wrap" as const,
+    gap: "8px",
   },
   headerLeft: {
     display: "flex",
@@ -380,13 +386,14 @@ const styles: Record<string, React.CSSProperties> = {
     display: "flex",
     gap: "28px",
     alignItems: "flex-start",
+    flexWrap: "wrap" as const,
   },
   playerColumn: {
-    flex: "1 1 58%",
+    flex: "1 1 400px",
     minWidth: 0,
   },
   resultsColumn: {
-    flex: "1 1 42%",
+    flex: "1 1 300px",
     minWidth: 0,
   },
   resultsFullWidth: {
