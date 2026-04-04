@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+.env
+*.egg-info/
+dist/
+build/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Data directory — all processed/generated files
+data/videos/
+data/audio/
+data/frames/
+data/graphs/
+data/db/
+
+# Model files / weights
+*.bin
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+models/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Node / Frontend
+node_modules/
+.npm/
+dist/
+*.local
+.eslintcache
+.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temp / Build artifacts
+cogni/
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# NVIDIA / Secrets
+.nvidia-api-key
+*.nvapi

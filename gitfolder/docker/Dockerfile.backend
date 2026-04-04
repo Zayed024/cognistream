@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────
+# CogniStream — Backend
+#
+# Slim Python image with system FFmpeg.
+# Pre-downloads ML models at build time so the container
+# runs fully offline with no network calls at runtime.
+# ─────────────────────────────────────────────────────────
+
+FROM python:3.11-slim AS base
+
+# ── System dependencies ────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python dependencies ────────────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Pre-download ML models for offline operation ───────
+# SentenceTransformer embedding model (~80 MB)
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Faster-Whisper base model (~150 MB, int8 via CTranslate2)
+RUN python -c "\
+from faster_whisper import WhisperModel; \
+WhisperModel('base', device='cpu', compute_type='int8')"
+
+# spaCy English small model (~50 MB)
+RUN python -m spacy download en_core_web_sm
+
+# ── Application code ───────────────────────────────────
+COPY backend/ ./backend/
+
+# ── Data directories (will be mounted as volumes) ──────
+RUN mkdir -p /app/data/videos /app/data/frames /app/data/audio \
+             /app/data/graphs /app/data/db/chroma
+
+# ── Environment ────────────────────────────────────────
+ENV COGNISTREAM_ROOT=/app
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Ollama runs in a sibling container
+ENV OLLAMA_BASE_URL=http://ollama:11434
+
+# ChromaDB runs in a sibling container
+ENV CHROMA_HOST=chromadb
+ENV CHROMA_PORT=8000
+
+# Conservative settings for edge deployment
+ENV WHISPER_MODEL_SIZE=base
+ENV WHISPER_DEVICE=cpu
+ENV WHISPER_COMPUTE_TYPE=int8
+ENV EMBEDDING_MODEL=all-MiniLM-L6-v2
+ENV OLLAMA_MODEL=moondream2
+ENV LOG_LEVEL=INFO
+
+EXPOSE 8000
+
+# ── Entrypoint ─────────────────────────────────────────
+CMD ["uvicorn", "backend.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--timeout-keep-alive", "120"]
