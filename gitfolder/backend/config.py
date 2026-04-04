@@ -110,6 +110,15 @@ MAX_CONCURRENT_JOBS = 1
 #                  "quality" = 4-pass VLM + sequential (original behavior)
 PIPELINE_MODE = os.getenv("PIPELINE_MODE", "fast")
 
+# Number of parallel workers for VLM frame analysis.
+# Local Ollama: keep at 1 (model handles one request at a time).
+# NVIDIA cloud: set to 4-8 for concurrent API calls.
+# Auto ("0") = 1 for local, 4 for NVIDIA cloud.
+VLM_WORKERS = int(os.getenv("VLM_WORKERS", "0"))
+
+# Number of parallel workers for shot detection (splits video into chunks).
+SHOT_DETECTION_WORKERS = int(os.getenv("SHOT_DETECTION_WORKERS", "2"))
+
 # Streaming / live-video chunk size in seconds
 STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
 

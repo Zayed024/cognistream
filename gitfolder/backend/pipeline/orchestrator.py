@@ -135,8 +135,20 @@ class PipelineOrchestrator:
             # Mark as processing
             self.db.update_status(meta.id, VideoStatus.PROCESSING)
 
-            # ── Stage 1–4: Ingestion ───────────────────────────
-            self._emit(progress, 1, "Shot detection")
+            # ── Stages 1-3: Ingestion (audio runs in parallel with visual) ─
+            self._emit(progress, 1, "Shot detection + Audio extraction (parallel)")
+
+            # Audio extraction is independent of shot detection — run in parallel
+            audio_result = None
+            def _extract_audio():
+                nonlocal audio_result
+                ext = AudioExtractor()
+                audio_result = ext.extract(meta)
+
+            audio_thread = threading.Thread(target=_extract_audio, daemon=True)
+            audio_thread.start()
+
+            # Shot detection + frame sampling (sequential, frame sampling needs shots)
             detector = ShotDetector()
             segments = detector.detect(meta)
 
@@ -144,11 +156,11 @@ class PipelineOrchestrator:
             sampler = FrameSampler()
             keyframes = sampler.sample(meta, segments)
 
-            self._emit(progress, 3, "Audio extraction")
-            extractor = AudioExtractor()
-            audio_result = extractor.extract(meta)
+            # Wait for audio extraction to finish
+            audio_thread.join()
+            self._emit(progress, 3, "Audio extraction complete")
 
-            # ── Stages 5+6: VLM + Whisper (PARALLEL) ──────────
+            # ── Stages 4+5: VLM + Whisper (PARALLEL) ──────────
             self._emit(progress, 4, "Visual + Audio analysis (parallel)")
             captions: list[VisualCaption] = []
             transcripts: list[TranscriptSegment] = []

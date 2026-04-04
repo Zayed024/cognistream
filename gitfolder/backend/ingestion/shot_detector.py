@@ -25,7 +25,7 @@ from typing import Sequence
 import cv2
 import numpy as np
 
-from backend.config import MIN_SEGMENT_FRAMES, SHOT_THRESHOLD
+from backend.config import MIN_SEGMENT_FRAMES, SHOT_DETECTION_WORKERS, SHOT_THRESHOLD
 from backend.db.models import ShotSegment, VideoMeta
 
 logger = logging.getLogger(__name__)
@@ -70,17 +70,26 @@ class ShotDetector:
     def detect(self, meta: VideoMeta) -> list[ShotSegment]:
         """Detect shot boundaries for the video described by *meta*.
 
+        Uses parallel chunk processing when SHOT_DETECTION_WORKERS > 1
+        and the video has enough frames to justify splitting.
+
         Returns:
             Sorted list of :class:`ShotSegment` covering the entire video.
         """
+        workers = SHOT_DETECTION_WORKERS
         logger.info(
-            "Starting shot detection: %s (%d frames, stride=%d)",
+            "Starting shot detection: %s (%d frames, stride=%d, workers=%d)",
             meta.filename,
             meta.total_frames,
             self.stride,
+            workers,
         )
 
-        boundaries = self._compute_boundaries(meta)
+        if workers > 1 and meta.total_frames > 500:
+            boundaries = self._compute_boundaries_parallel(meta, workers)
+        else:
+            boundaries = self._compute_boundaries(meta)
+
         segments = self._boundaries_to_segments(boundaries, meta)
         segments = self._merge_short_segments(segments)
 
@@ -99,6 +108,67 @@ class ShotDetector:
         hist = cv2.calcHist([hsv], _HIST_CHANNELS, None, _HIST_SIZE, _HIST_RANGES)
         cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
         return hist
+
+    def _compute_boundaries_parallel(
+        self, meta: VideoMeta, workers: int
+    ) -> list[int]:
+        """Split the video into chunks and detect boundaries concurrently.
+
+        Each worker opens its own cv2.VideoCapture (thread-safe since they
+        are separate file handles).  Chunk boundaries are stitched together
+        and de-duplicated.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        total = meta.total_frames
+        chunk_size = max(100, total // workers)
+        chunks: list[tuple[int, int]] = []
+        start = 0
+        while start < total:
+            end = min(start + chunk_size, total)
+            chunks.append((start, end))
+            start = end
+
+        logger.debug("Parallel shot detection: %d chunks across %d workers", len(chunks), workers)
+
+        def _detect_chunk(frame_range: tuple[int, int]) -> list[int]:
+            """Detect boundaries within a frame range using a private VideoCapture."""
+            start_frame, end_frame = frame_range
+            cap = cv2.VideoCapture(meta.file_path)
+            if not cap.isOpened():
+                return []
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            chunk_boundaries: list[int] = []
+            prev_hist: np.ndarray | None = None
+            frame_idx = start_frame
+
+            try:
+                while frame_idx < end_frame:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if frame_idx % self.stride == 0:
+                        hist = self._compute_histogram(frame)
+                        if prev_hist is not None:
+                            corr = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
+                            if corr < self.threshold:
+                                chunk_boundaries.append(frame_idx)
+                        prev_hist = hist
+                    frame_idx += 1
+            finally:
+                cap.release()
+
+            return chunk_boundaries
+
+        all_boundaries = [0]  # video always starts with a boundary
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="shot") as pool:
+            results = pool.map(_detect_chunk, chunks)
+            for chunk_result in results:
+                all_boundaries.extend(chunk_result)
+
+        # De-duplicate and sort
+        return sorted(set(all_boundaries))
 
     def _compute_boundaries(self, meta: VideoMeta) -> list[int]:
         """Walk through the video, returning frame numbers where shots change."""

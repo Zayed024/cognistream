@@ -40,6 +40,7 @@ from backend.config import (
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT,
     PIPELINE_MODE,
+    VLM_WORKERS,
 )
 from backend.db.models import Keyframe, VisualCaption
 from backend.visual.caption_processor import CaptionProcessor, PromptLibrary
@@ -225,7 +226,6 @@ class VLMRunner:
                 f"or model '{self.client.model}' is not pulled."
             )
 
-        captions: list[VisualCaption] = []
         t_start = time.monotonic()
 
         # Choose analysis function: NVIDIA cloud > local fast > local quality
@@ -240,21 +240,22 @@ class VLMRunner:
             analyse_fn = self._analyse_single
             mode_label = "quality (4-pass)"
 
-        logger.info("VLM mode: %s", mode_label)
+        # Determine worker count:
+        #   0 (auto) = 1 for local Ollama, 4 for NVIDIA cloud
+        #   1 = sequential (original behavior, best for local Ollama)
+        #   2+ = concurrent (best for NVIDIA cloud or fast local GPU)
+        workers = VLM_WORKERS
+        if workers <= 0:
+            workers = 4 if nvidia.available else 1
 
-        for idx, kf in enumerate(keyframes, 1):
-            caption = analyse_fn(kf)
-            captions.append(caption)
+        logger.info("VLM mode: %s, workers: %d", mode_label, workers)
 
-            if idx % 10 == 0 or idx == total:
-                elapsed = time.monotonic() - t_start
-                rate = idx / elapsed if elapsed > 0 else 0
-                logger.info(
-                    "VLM progress: %d/%d keyframes (%.1f frames/min)",
-                    idx,
-                    total,
-                    rate * 60,
-                )
+        if workers == 1:
+            # Sequential — no thread overhead, best for single-model Ollama
+            captions = self._run_sequential(keyframes, analyse_fn, t_start, total)
+        else:
+            # Concurrent — multiple frames at once via thread pool
+            captions = self._run_concurrent(keyframes, analyse_fn, workers, t_start, total)
 
         logger.info(
             "VLM analysis complete: %d captions in %.1fs",
@@ -262,6 +263,81 @@ class VLMRunner:
             time.monotonic() - t_start,
         )
         return captions
+
+    def _run_sequential(
+        self,
+        keyframes: list[Keyframe],
+        analyse_fn,
+        t_start: float,
+        total: int,
+    ) -> list[VisualCaption]:
+        """Process frames one at a time (original behavior)."""
+        captions: list[VisualCaption] = []
+        for idx, kf in enumerate(keyframes, 1):
+            caption = analyse_fn(kf)
+            captions.append(caption)
+            if idx % 10 == 0 or idx == total:
+                elapsed = time.monotonic() - t_start
+                rate = idx / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "VLM progress: %d/%d keyframes (%.1f frames/min)",
+                    idx, total, rate * 60,
+                )
+        return captions
+
+    def _run_concurrent(
+        self,
+        keyframes: list[Keyframe],
+        analyse_fn,
+        workers: int,
+        t_start: float,
+        total: int,
+    ) -> list[VisualCaption]:
+        """Process multiple frames concurrently via thread pool.
+
+        Results are returned in the same order as the input keyframes.
+        Failed frames get a fallback caption instead of crashing the batch.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Map future → original index to preserve ordering
+        captions: list[VisualCaption | None] = [None] * total
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vlm") as pool:
+            future_to_idx = {
+                pool.submit(analyse_fn, kf): i
+                for i, kf in enumerate(keyframes)
+            }
+
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    captions[idx] = future.result()
+                except Exception as exc:
+                    logger.error(
+                        "VLM worker failed on frame %d: %s",
+                        keyframes[idx].frame_number, exc,
+                    )
+                    # Fallback: empty caption so the pipeline continues
+                    captions[idx] = VisualCaption(
+                        keyframe=keyframes[idx],
+                        scene_description="Analysis failed.",
+                        objects=[],
+                        activity="unknown",
+                        anomaly=None,
+                    )
+
+                completed += 1
+                if completed % 10 == 0 or completed == total:
+                    elapsed = time.monotonic() - t_start
+                    rate = completed / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        "VLM progress: %d/%d keyframes (%.1f frames/min, %d workers)",
+                        completed, total, rate * 60, workers,
+                    )
+
+        return [c for c in captions if c is not None]
 
     # ── single-frame analysis ───────────────────────────────────
 
