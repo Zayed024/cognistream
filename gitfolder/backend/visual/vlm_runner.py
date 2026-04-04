@@ -39,6 +39,7 @@ from backend.config import (
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT,
+    PIPELINE_MODE,
 )
 from backend.db.models import Keyframe, VisualCaption
 from backend.visual.caption_processor import CaptionProcessor, PromptLibrary
@@ -188,10 +189,12 @@ class VLMRunner:
         client: OllamaClient | None = None,
         processor: CaptionProcessor | None = None,
         max_retries: int = 2,
+        fast_mode: bool | None = None,
     ):
         self.client = client or OllamaClient()
         self.processor = processor or CaptionProcessor()
         self.max_retries = max_retries
+        self.fast_mode = fast_mode if fast_mode is not None else (PIPELINE_MODE == "fast")
 
     def analyse_keyframes(
         self,
@@ -225,8 +228,22 @@ class VLMRunner:
         captions: list[VisualCaption] = []
         t_start = time.monotonic()
 
+        # Choose analysis function: NVIDIA cloud > local fast > local quality
+        from backend.providers.nvidia import nvidia
+        if nvidia.available:
+            analyse_fn = self._analyse_single_nvidia
+            mode_label = "nvidia (cloud)"
+        elif self.fast_mode:
+            analyse_fn = self._analyse_single_fast
+            mode_label = "fast (single-pass)"
+        else:
+            analyse_fn = self._analyse_single
+            mode_label = "quality (4-pass)"
+
+        logger.info("VLM mode: %s", mode_label)
+
         for idx, kf in enumerate(keyframes, 1):
-            caption = self._analyse_single(kf)
+            caption = analyse_fn(kf)
             captions.append(caption)
 
             if idx % 10 == 0 or idx == total:
@@ -247,6 +264,52 @@ class VLMRunner:
         return captions
 
     # ── single-frame analysis ───────────────────────────────────
+
+    def _analyse_single_nvidia(self, keyframe: Keyframe) -> VisualCaption:
+        """Run analysis using NVIDIA cloud VLM (highest quality, requires API key)."""
+        from backend.providers.nvidia import nvidia
+
+        combined_raw = nvidia.caption_image(
+            keyframe.file_path,
+            PromptLibrary.combined_prompt(),
+        ) or ""
+
+        caption = self.processor.build_caption_from_combined(
+            keyframe=keyframe,
+            combined_raw=combined_raw,
+        )
+
+        logger.debug(
+            "Frame %d (nvidia) → scene=%d chars, objects=%d",
+            keyframe.frame_number,
+            len(caption.scene_description),
+            len(caption.objects),
+        )
+        return caption
+
+    def _analyse_single_fast(self, keyframe: Keyframe) -> VisualCaption:
+        """Run a single combined pass on one keyframe (fast mode).
+
+        One VLM call instead of four — ~75% faster per frame.
+        """
+        image_path = keyframe.file_path
+
+        combined_raw = self._call_with_retry(
+            PromptLibrary.combined_prompt(), image_path, "combined"
+        )
+
+        caption = self.processor.build_caption_from_combined(
+            keyframe=keyframe,
+            combined_raw=combined_raw,
+        )
+
+        logger.debug(
+            "Frame %d (fast) → scene=%d chars, objects=%d",
+            keyframe.frame_number,
+            len(caption.scene_description),
+            len(caption.objects),
+        )
+        return caption
 
     def _analyse_single(self, keyframe: Keyframe) -> VisualCaption:
         """Run all four analysis passes on one keyframe."""

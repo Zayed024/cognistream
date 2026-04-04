@@ -205,6 +205,9 @@ class WhisperRunner:
     ) -> list[TranscriptSegment]:
         """Transcribe an audio file into timestamped segments.
 
+        Uses NVIDIA Parakeet ASR when available (cloud, higher quality),
+        otherwise falls back to local Faster-Whisper.
+
         Args:
             audio_path:        Path to a 16 kHz mono WAV file.
             language:          ISO 639-1 code (e.g. "en").  ``None`` for
@@ -218,6 +221,27 @@ class WhisperRunner:
         audio_path = Path(audio_path)
         if not audio_path.is_file():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Try NVIDIA cloud ASR first
+        from backend.providers.nvidia import nvidia
+        if nvidia.available:
+            logger.info("Transcribing via NVIDIA ASR: %s", audio_path.name)
+            result = nvidia.transcribe(str(audio_path))
+            if result is not None:
+                transcript = [
+                    TranscriptSegment(
+                        start_time=round(seg["start_time"], 3),
+                        end_time=round(seg["end_time"], 3),
+                        text=seg["text"],
+                    )
+                    for seg in result
+                    if seg["text"].strip()
+                ]
+                logger.info("NVIDIA ASR: %d segments", len(transcript))
+                if extract_keywords and transcript:
+                    self._keyword_extractor.extract(transcript)
+                return transcript
+            logger.warning("NVIDIA ASR failed, falling back to local Whisper")
 
         model = self._get_model()
 

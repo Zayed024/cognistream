@@ -88,6 +88,21 @@ class PromptLibrary:
             "If nothing is unusual, respond with exactly: none"
         )
 
+    @staticmethod
+    def combined_prompt() -> str:
+        """Single-pass prompt that extracts all four fields at once.
+
+        ~75% faster than four separate calls.  Designed for small VLMs
+        that can handle brief structured output.
+        """
+        return (
+            "Analyze this image. Respond with EXACTLY this format:\n"
+            "SCENE: [2-3 sentence description of setting and atmosphere]\n"
+            "OBJECTS: [comma-separated list of visible objects]\n"
+            "ACTIVITY: [one sentence describing what is happening]\n"
+            "ANOMALY: [anything unusual, or 'none']"
+        )
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Response parser
@@ -219,6 +234,50 @@ class CaptionProcessor:
             return None
 
         return text
+
+    def build_caption_from_combined(
+        self,
+        keyframe: Keyframe,
+        combined_raw: str,
+    ) -> VisualCaption:
+        """Parse a single-pass combined VLM response into a VisualCaption.
+
+        Expected format:
+            SCENE: ...
+            OBJECTS: ...
+            ACTIVITY: ...
+            ANOMALY: ...
+
+        Falls back gracefully if the model doesn't follow the format exactly.
+        """
+        fields = self._parse_combined_fields(combined_raw)
+
+        return VisualCaption(
+            keyframe=keyframe,
+            scene_description=self._parse_scene(fields.get("scene", "")),
+            objects=self._parse_objects(fields.get("objects", "")),
+            activity=self._parse_activity(fields.get("activity", "")),
+            anomaly=self._parse_anomaly(fields.get("anomaly", "")),
+        )
+
+    @staticmethod
+    def _parse_combined_fields(raw: str) -> dict[str, str]:
+        """Extract labelled fields from a combined VLM response."""
+        fields: dict[str, str] = {}
+        labels = ["scene", "objects", "activity", "anomaly"]
+
+        for label in labels:
+            # Match "LABEL:" or "Label:" at start of line
+            pattern = rf"(?i)^{label}\s*:\s*(.+?)(?=\n(?:{'|'.join(labels)})\s*:|$)"
+            match = re.search(pattern, raw, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+            if match:
+                fields[label] = match.group(1).strip()
+
+        # Fallback: if no fields parsed, treat entire text as scene description
+        if not fields:
+            fields["scene"] = raw.strip()
+
+        return fields
 
     # ── text utilities ──────────────────────────────────────────
 

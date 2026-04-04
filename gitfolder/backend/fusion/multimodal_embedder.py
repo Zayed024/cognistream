@@ -181,26 +181,41 @@ class MultimodalEmbedder:
     def embed(self, segments: list[FusedSegment]) -> list[FusedSegment]:
         """Encode all segment texts as dense vectors (in-place).
 
-        Populates the ``.embedding`` field on each segment.  Uses batched
-        encoding for throughput.
-
-        Returns:
-            The same list with embeddings populated.
+        Uses NVIDIA NV-Embed when available, otherwise falls back to
+        local SentenceTransformers.
         """
         if not segments:
             return segments
 
-        model = self._get_model()
-        texts = [seg.text for seg in segments]
+        from backend.providers.nvidia import nvidia
 
-        logger.info("Embedding %d segments (batch_size=%d)", len(texts), _ENCODE_BATCH_SIZE)
+        texts = [seg.text for seg in segments]
         t_start = time.monotonic()
+
+        # Try NVIDIA cloud embeddings first
+        if nvidia.available:
+            logger.info("Embedding %d segments via NVIDIA NV-Embed", len(texts))
+            vectors = nvidia.embed_texts(texts, input_type="passage")
+            if vectors and len(vectors) == len(segments):
+                for seg, vec in zip(segments, vectors):
+                    seg.embedding = vec
+                elapsed = time.monotonic() - t_start
+                logger.info(
+                    "NVIDIA embedding complete: %d vectors in %.1fs",
+                    len(segments), elapsed,
+                )
+                return segments
+            logger.warning("NVIDIA embed failed or partial, falling back to local")
+
+        # Local SentenceTransformers fallback
+        model = self._get_model()
+        logger.info("Embedding %d segments locally (batch_size=%d)", len(texts), _ENCODE_BATCH_SIZE)
 
         vectors = model.encode(
             texts,
             batch_size=_ENCODE_BATCH_SIZE,
             show_progress_bar=False,
-            normalize_embeddings=True,  # unit vectors for cosine similarity
+            normalize_embeddings=True,
         )
 
         for seg, vec in zip(segments, vectors):
@@ -218,9 +233,15 @@ class MultimodalEmbedder:
     def embed_query(self, query: str) -> list[float]:
         """Encode a single query string into a vector.
 
-        Uses the same model as segment embedding, so the vectors live
-        in the same space and cosine similarity is valid.
+        Uses NVIDIA when available, otherwise local SentenceTransformers.
         """
+        from backend.providers.nvidia import nvidia
+
+        if nvidia.available:
+            vec = nvidia.embed_text(query, input_type="query")
+            if vec:
+                return vec
+
         model = self._get_model()
         vec = model.encode(
             query,

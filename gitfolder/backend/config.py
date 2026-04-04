@@ -53,20 +53,20 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 # Ollama (Visual Narrative Engine)
 # ──────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "moondream2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "moondream")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 # ──────────────────────────────────────────────
 # Faster-Whisper (Audio Transcriber)
 # ──────────────────────────────────────────────
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 
 # ──────────────────────────────────────────────
 # Embeddings (Multimodal Fusion)
 # ──────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_DIM = 384
 
 # ──────────────────────────────────────────────
@@ -95,6 +95,34 @@ DEFAULT_TOP_K = 10
 # Only one video processes at a time on edge hardware.
 # Additional submissions are rejected while processing.
 MAX_CONCURRENT_JOBS = 1
+
+# Processing mode: "fast" = single-pass VLM + parallel stages (3-4x faster)
+#                  "quality" = 4-pass VLM + sequential (original behavior)
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "fast")
+
+# Streaming / live-video chunk size in seconds
+STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
+
+# ──────────────────────────────────────────────
+# NVIDIA NIM Cloud (optional — set API key to enable)
+# When enabled, NVIDIA models are used for higher quality.
+# When disabled (default), local models (Ollama/Whisper) are used.
+# ──────────────────────────────────────────────
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+# Which NVIDIA models to use (only active when NVIDIA_API_KEY is set)
+NVIDIA_VLM_MODEL = os.getenv("NVIDIA_VLM_MODEL", "meta/llama-3.2-11b-vision-instruct")
+NVIDIA_EMBED_MODEL = os.getenv("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
+NVIDIA_ASR_MODEL = os.getenv("NVIDIA_ASR_MODEL", "nvidia/parakeet-ctc-1_1b-asr")
+NVIDIA_ASR_FUNCTION_ID = os.getenv("NVIDIA_ASR_FUNCTION_ID", "1598d209-5e27-4d3c-8079-4751568b1081")
+NVIDIA_CLIP_MODEL = os.getenv("NVIDIA_CLIP_MODEL", "nvidia/nvclip-vit-h-14")
+NVIDIA_GROUNDING_MODEL = os.getenv("NVIDIA_GROUNDING_MODEL", "nvidia/nv-grounding-dino")
+NVIDIA_GROUNDING_URL = os.getenv("NVIDIA_GROUNDING_URL", "https://ai.api.nvidia.com/v1/cv/nvidia/nv-grounding-dino")
+
+def is_nvidia_enabled() -> bool:
+    """True if NVIDIA cloud mode is active (API key provided)."""
+    return bool(NVIDIA_API_KEY)
 
 # ──────────────────────────────────────────────
 # Logging

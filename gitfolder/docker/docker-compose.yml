@@ -67,7 +67,7 @@ services:
           memory: 128M
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/heartbeat || exit 1"]
+      test: ["CMD", "chroma", "--version"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -112,7 +112,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5

@@ -29,7 +29,7 @@ export default function VideoPlayer({
         <svg style={styles.placeholderIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
           <polygon points="5,3 19,12 5,21" />
         </svg>
-        <p style={styles.placeholderText}>Search for content to begin playback</p>
+        <p style={styles.placeholderText}>Select a video to begin</p>
       </div>
     );
   }

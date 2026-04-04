@@ -237,6 +237,23 @@ class ChromaStore:
         items.sort(key=lambda x: x.get("start_time", 0.0))
         return items
 
+    def get_segment(self, segment_id: str) -> dict | None:
+        """Retrieve a single segment by ID, including its embedding."""
+        collection = self._get_collection()
+        result = collection.get(
+            ids=[segment_id],
+            include=["documents", "metadatas", "embeddings"],
+        )
+        if not result["ids"]:
+            return None
+        meta = result["metadatas"][0] if result["metadatas"] else {}
+        return {
+            "id": result["ids"][0],
+            "text": result["documents"][0] if result["documents"] else "",
+            "embedding": result["embeddings"][0] if result["embeddings"] else None,
+            **meta,
+        }
+
     def count(self, video_id: Optional[str] = None) -> int:
         """Return the number of stored segments, optionally filtered."""
         collection = self._get_collection()
