@@ -48,10 +48,40 @@ class NvidiaProvider:
     def __init__(self):
         self._client: Optional[httpx.Client] = None
         self._grounding_client: Optional[httpx.Client] = None
+        self._failure_streak = 0
+        self._disabled_until = 0.0
+
+    _FAILURE_THRESHOLD = 3
+    _DISABLE_SECONDS = 300
 
     @property
     def available(self) -> bool:
-        return is_nvidia_enabled()
+        if not is_nvidia_enabled():
+            return False
+        if time.monotonic() < self._disabled_until:
+            return False
+        return True
+
+    def _record_success(self) -> None:
+        self._failure_streak = 0
+
+    def _record_failure(self, exc: Exception) -> None:
+        self._failure_streak += 1
+        msg = str(exc).lower()
+        network_like = (
+            "getaddrinfo" in msg
+            or "name or service not known" in msg
+            or "temporary failure in name resolution" in msg
+            or "timed out" in msg
+            or "connection" in msg
+        )
+        if network_like and self._failure_streak >= self._FAILURE_THRESHOLD:
+            self._disabled_until = time.monotonic() + self._DISABLE_SECONDS
+            logger.warning(
+                "NVIDIA cloud circuit opened for %ds after %d consecutive failures; falling back to local providers.",
+                self._DISABLE_SECONDS,
+                self._failure_streak,
+            )
 
     def _get_client(self) -> httpx.Client:
         """Client for integrate.api.nvidia.com (embeddings, chat)."""
@@ -109,8 +139,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return data["data"][0]["embedding"]
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NVCLIP image embed failed: %s", exc)
             return None
 
@@ -130,8 +162,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return [item["embedding"] for item in data["data"]]
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NVCLIP batch image embed failed: %s", exc)
             return None
 
@@ -157,8 +191,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return data["data"][0]["embedding"]
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NV-Embed text embed failed: %s", exc)
             return None
 
@@ -181,8 +217,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return [item["embedding"] for item in data["data"]]
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NV-Embed batch embed failed: %s", exc)
             return None
 
@@ -230,8 +268,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return self._parse_detections(data, threshold)
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NV-Grounding-DINO detection failed: %s", exc)
             return None
 
@@ -308,8 +348,10 @@ class NvidiaProvider:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._record_success()
             return data["choices"][0]["message"]["content"].strip()
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NVIDIA VLM caption failed: %s", exc)
             return None
 
@@ -388,6 +430,7 @@ class NvidiaProvider:
             )
             return None
         except Exception as exc:
+            self._record_failure(exc)
             logger.warning("NVIDIA Parakeet ASR failed: %s", exc)
             return None
 

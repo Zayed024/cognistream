@@ -190,7 +190,9 @@ class WhisperRunner:
         keywords_top_k: int = 5,
     ):
         self.model_size = model_size or WHISPER_MODEL_SIZE
-        self.device = device or WHISPER_DEVICE
+        configured_device = (device or WHISPER_DEVICE).strip().lower()
+        # Backward-compatible alias used in older env samples.
+        self.device = "cuda" if configured_device == "gpu" else configured_device
         self.compute_type = compute_type or WHISPER_COMPUTE_TYPE
         self._model = None  # lazy loaded
         self._keyword_extractor = KeywordExtractor(top_k=keywords_top_k)
@@ -315,11 +317,27 @@ class WhisperRunner:
 
         from faster_whisper import WhisperModel
 
-        self._model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
+        try:
+            self._model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+        except Exception as exc:
+            if self.device != "cpu":
+                logger.warning(
+                    "Whisper device '%s' unavailable (%s). Falling back to CPU.",
+                    self.device,
+                    exc,
+                )
+                self.device = "cpu"
+                self._model = WhisperModel(
+                    self.model_size,
+                    device=self.device,
+                    compute_type="int8",
+                )
+            else:
+                raise
 
         logger.info(
             "Whisper model loaded in %.1fs",

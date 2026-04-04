@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
+from pathlib import Path
+import os
+import uuid
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -19,15 +23,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.api.router import init_event_loop, router
-from backend.config import API_KEY, API_KEYS, LOG_LEVEL, RATE_LIMIT_RPM
+from backend.config import (
+    API_KEY,
+    API_KEYS,
+    LOG_DIR,
+    LOG_TO_FILE,
+    LOG_FILE_LEVEL,
+    LOG_LEVEL,
+    RATE_LIMIT_RPM,
+    get_pipeline_tuning_summary,
+)
 from backend.db.sqlite import SQLiteDB
 
 # ── Logging ────────────────────────────────────────────────────
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+_RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+_console_handler.setFormatter(logging.Formatter("%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s", datefmt="%H:%M:%S"))
+root_logger.addHandler(_console_handler)
+
+if LOG_TO_FILE:
+    log_path = Path(LOG_DIR) / f"run-{_RUN_ID}.log"
+    _file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    _file_handler.setLevel(getattr(logging, LOG_FILE_LEVEL, logging.DEBUG))
+    _file_handler.setFormatter(logging.Formatter("%(asctime)s  %(name)-30s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    root_logger.addHandler(_file_handler)
+    logging.getLogger(__name__).info("Debug log file enabled: %s", log_path)
 
 # ── Lifespan ───────────────────────────────────────────────────
 @asynccontextmanager
@@ -35,6 +60,22 @@ async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle handler."""
     # Capture the running event loop so background threads can use it safely
     init_event_loop(asyncio.get_running_loop())
+
+    tuning = get_pipeline_tuning_summary()
+    logging.getLogger(__name__).info("Run ID: %s", _RUN_ID)
+    logging.getLogger(__name__).info("Hardware profile: %s", {
+        "platform": tuning["platform"],
+        "cpu_cores": tuning["cpu_cores"],
+        "ram_gb": tuning["ram_gb"],
+        "cuda": tuning["cuda"],
+        "cuda_vram_gb": tuning["cuda_vram_gb"],
+    })
+    logging.getLogger(__name__).info("Pipeline tuning: %s", {
+        "auto_tune": tuning["auto_tune"],
+        "nvidia_cloud_mode": tuning["nvidia_cloud_mode"],
+        "resolved_workers": tuning["resolved_workers"],
+        "env_overrides": tuning["env_overrides"],
+    })
 
     # Reset any videos stuck in PROCESSING from a previous crash
     db = SQLiteDB()

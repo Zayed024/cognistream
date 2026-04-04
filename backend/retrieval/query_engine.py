@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -60,6 +61,16 @@ _TEMPORAL_SIGMA = _TEMPORAL_WINDOW / 3.0
 # Over-fetch factor: retrieve more candidates from ChromaDB than top_k
 # so the re-ranker has room to promote temporally clustered results.
 _OVERFETCH_FACTOR = 2
+_LEXICAL_WEIGHT = 0.20
+_SOURCE_PRIOR_WEIGHT = 0.08
+
+_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "it", "this", "that", "these", "those", "as", "if", "then", "than",
+    "not", "no", "you", "your", "i", "we", "they", "he", "she", "them",
+}
 
 
 class QueryEngine:
@@ -111,12 +122,46 @@ class QueryEngine:
 
         # Stage 2: vector search (over-fetch for re-ranking headroom)
         fetch_k = min(top_k * _OVERFETCH_FACTOR, top_k + 20)
-        raw_results = self.store.query(
-            embedding=query_embedding,
-            top_k=fetch_k,
-            video_id=video_id,
-            source_filter=source_filter,
-        )
+        try:
+            raw_results = self.store.query(
+                embedding=query_embedding,
+                top_k=fetch_k,
+                video_id=video_id,
+                source_filter=source_filter,
+            )
+        except Exception as exc:
+            if not self._is_dimension_mismatch(exc):
+                raise
+
+            expected_dim, got_dim = self._parse_dims(str(exc))
+            logger.warning(
+                "Embedding dimension mismatch during search (expected=%s, got=%s). Retrying with compatible query embedding.",
+                expected_dim,
+                got_dim,
+            )
+
+            if expected_dim == 384:
+                query_embedding = self.embedder.embed_query_local(query)
+            elif expected_dim == 1024:
+                from backend.providers.nvidia import nvidia
+
+                vec = nvidia.embed_text(query, input_type="query") if nvidia.available else None
+                if not vec:
+                    # Fall back to local if NVIDIA is unavailable; this may still fail,
+                    # but preserves graceful behavior in degraded environments.
+                    query_embedding = self.embedder.embed_query_local(query)
+                else:
+                    query_embedding = vec
+            else:
+                # Unknown expected dimension; safest retry is local embedding.
+                query_embedding = self.embedder.embed_query_local(query)
+
+            raw_results = self.store.query(
+                embedding=query_embedding,
+                top_k=fetch_k,
+                video_id=video_id,
+                source_filter=source_filter,
+            )
 
         if not raw_results:
             logger.info("No results found for query: '%s'", query)
@@ -126,6 +171,9 @@ class QueryEngine:
 
         # Stage 3: temporal re-ranking
         reranked = self._temporal_rerank(raw_results)
+
+        # Stage 3b: hybrid reranking for better query differentiation
+        reranked = self._hybrid_rerank(reranked, query)
 
         # Stage 4: format and trim to top_k
         results = self._format(reranked[:top_k])
@@ -209,6 +257,51 @@ class QueryEngine:
         )
         return candidates
 
+    def _hybrid_rerank(self, candidates: list[dict], query: str) -> list[dict]:
+        """Refine ranking with lexical signal and robustness penalties.
+
+        Helps separate semantically similar queries by boosting candidates
+        whose text explicitly overlaps with query terms.
+        """
+        q_tokens = self._tokenise(query)
+        if not q_tokens:
+            return candidates
+
+        for c in candidates:
+            semantic = float(c.get("score", 0.0))
+            text = str(c.get("text", ""))
+            t_tokens = self._tokenise(text)
+
+            overlap = len(q_tokens & t_tokens)
+            lexical = overlap / max(1, len(q_tokens))
+
+            source = str(c.get("source_type", ""))
+            source_prior = {
+                "fused": 1.00,
+                "visual": 0.90,
+                "audio": 0.82,
+                "event": 0.88,
+            }.get(source, 0.85)
+
+            generic_penalty = 0.0
+            lowered = text.lower()
+            if "no scene description available" in lowered:
+                generic_penalty += 0.10
+            if "activity: static scene" in lowered:
+                generic_penalty += 0.06
+
+            blended = (
+                semantic * (1.0 - _LEXICAL_WEIGHT - _SOURCE_PRIOR_WEIGHT)
+                + lexical * _LEXICAL_WEIGHT
+                + source_prior * _SOURCE_PRIOR_WEIGHT
+                - generic_penalty
+            )
+            c["score"] = round(max(0.0, min(1.0, blended)), 4)
+            c["_lexical_overlap"] = overlap
+
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Stage 4: Format results
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -245,3 +338,23 @@ class QueryEngine:
             )
 
         return results
+
+    @staticmethod
+    def _is_dimension_mismatch(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "expecting embedding with dimension" in text and "got" in text
+
+    @staticmethod
+    def _parse_dims(message: str) -> tuple[int | None, int | None]:
+        match = re.search(r"dimension of\s+(\d+)\s*,\s*got\s+(\d+)", message)
+        if not match:
+            return None, None
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _tokenise(text: str) -> set[str]:
+        tokens = {
+            t for t in re.findall(r"[a-zA-Z0-9]+", text.lower())
+            if len(t) >= 3 and t not in _STOP_WORDS
+        }
+        return tokens

@@ -85,3 +85,88 @@ class TestSQLiteDB:
         videos = db.list_videos()
         assert len(videos) == 1
         assert videos[0].status == VideoStatus.PROCESSED
+
+    def test_save_and_get_latest_benchmark(self, db, video_meta):
+        db.save_video(video_meta)
+
+        db.save_benchmark_run(
+            {
+                "id": "run1",
+                "video_id": "vid001",
+                "captured_at": "2026-01-01T00:00:00Z",
+                "success": True,
+                "elapsed_sec": 12.4,
+                "segments_stored": 11,
+                "events_detected": 2,
+                "stage_timings": {"vlm_sec": 4.1},
+                "quality_metrics": {"keyframes_kept": 24.0},
+                "warnings": [],
+                "errors": [],
+            }
+        )
+
+        latest = db.get_latest_benchmark("vid001")
+        assert latest is not None
+        assert latest["id"] == "run1"
+        assert latest["success"] is True
+        assert latest["stage_timings"]["vlm_sec"] == 4.1
+
+    def test_list_benchmark_runs_ordered_desc(self, db, video_meta):
+        db.save_video(video_meta)
+
+        db.save_benchmark_run(
+            {
+                "id": "run_old",
+                "video_id": "vid001",
+                "captured_at": "2026-01-01T00:00:00Z",
+                "success": True,
+                "elapsed_sec": 14.0,
+                "segments_stored": 10,
+                "events_detected": 1,
+                "stage_timings": {},
+                "quality_metrics": {},
+                "warnings": [],
+                "errors": [],
+            }
+        )
+        db.save_benchmark_run(
+            {
+                "id": "run_new",
+                "video_id": "vid001",
+                "captured_at": "2026-01-01T01:00:00Z",
+                "success": True,
+                "elapsed_sec": 9.0,
+                "segments_stored": 13,
+                "events_detected": 3,
+                "stage_timings": {},
+                "quality_metrics": {},
+                "warnings": [],
+                "errors": [],
+            }
+        )
+
+        runs = db.list_benchmark_runs("vid001", limit=5)
+        assert len(runs) == 2
+        assert runs[0]["id"] == "run_new"
+        assert runs[1]["id"] == "run_old"
+
+    def test_benchmark_deleted_with_video(self, db, video_meta):
+        db.save_video(video_meta)
+        db.save_benchmark_run(
+            {
+                "id": "run1",
+                "video_id": "vid001",
+                "captured_at": "2026-01-01T00:00:00Z",
+                "success": True,
+                "elapsed_sec": 12.0,
+                "segments_stored": 1,
+                "events_detected": 0,
+                "stage_timings": {},
+                "quality_metrics": {},
+                "warnings": [],
+                "errors": [],
+            }
+        )
+
+        db.delete_video("vid001")
+        assert db.get_latest_benchmark("vid001") is None

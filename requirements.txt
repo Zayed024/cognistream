@@ -5,6 +5,7 @@
 fastapi==0.115.9
 uvicorn[standard]==0.34.3
 python-multipart==0.0.20
+python-dotenv==1.0.1
 
 # Video / audio processing
 opencv-python-headless==4.11.0.86
@@ -19,6 +20,8 @@ sentence-transformers==4.1.0
 # Vector database (full package — needed for both embedded PersistentClient
 # in local dev and HttpClient in Docker mode)
 chromadb==1.0.11
+# Chroma 1.0.x telemetry client expects pre-6 posthog capture signature.
+posthog<6
 
 # HTTP client (for Ollama)
 httpx==0.28.1

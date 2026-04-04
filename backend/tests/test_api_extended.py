@@ -255,6 +255,99 @@ def test_progress_404(mocks):
     assert resp.status_code == 404
 
 
+def test_benchmark_success(mocks):
+    """Benchmark endpoint returns stored metrics for an existing video."""
+    mocks["db"].get_video.return_value = _make_meta(video_id="vbench", status=VideoStatus.PROCESSED)
+    mocks["db"].get_latest_benchmark.return_value = {
+        "id": "run1",
+        "video_id": "vbench",
+        "success": True,
+        "elapsed_sec": 12.3,
+        "stage_timings": {"vlm_sec": 4.2},
+        "quality_metrics": {"keyframes_kept": 10.0},
+    }
+
+    resp = mocks["client"].get("/video/vbench/benchmark")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["video_id"] == "vbench"
+    assert body["success"] is True
+    assert body["stage_timings"]["vlm_sec"] == 4.2
+
+
+def test_benchmark_404_when_missing(mocks):
+    """Benchmark endpoint returns 404 when video exists but no metrics are captured."""
+    mocks["db"].get_video.return_value = _make_meta(video_id="vbench", status=VideoStatus.PROCESSED)
+    mocks["db"].get_latest_benchmark.return_value = None
+
+    resp = mocks["client"].get("/video/vbench/benchmark")
+    assert resp.status_code == 404
+    assert "No benchmark metrics available" in resp.json()["detail"]
+
+
+def test_benchmark_history_success(mocks):
+    """Benchmark history returns a bounded list of benchmark runs."""
+    mocks["db"].get_video.return_value = _make_meta(video_id="vbench", status=VideoStatus.PROCESSED)
+    mocks["db"].list_benchmark_runs.return_value = [
+        {"id": "r2", "video_id": "vbench", "elapsed_sec": 8.0},
+        {"id": "r1", "video_id": "vbench", "elapsed_sec": 9.1},
+    ]
+
+    resp = mocks["client"].get("/video/vbench/benchmark/history?limit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["video_id"] == "vbench"
+    assert body["count"] == 2
+    assert body["runs"][0]["id"] == "r2"
+
+
+def test_benchmark_trend_success(mocks):
+    """Benchmark trend computes deltas between latest and oldest runs."""
+    mocks["db"].get_video.return_value = _make_meta(video_id="vbench", status=VideoStatus.PROCESSED)
+    mocks["db"].list_benchmark_runs.return_value = [
+        {
+            "id": "new",
+            "video_id": "vbench",
+            "elapsed_sec": 8.0,
+            "stage_timings": {"vlm_sec": 3.5, "store_sec": 0.8},
+            "quality_metrics": {
+                "captions_fallback_ratio": 0.1,
+                "captions_static_ratio": 0.2,
+                "keyframes_kept": 30,
+            },
+        },
+        {
+            "id": "old",
+            "video_id": "vbench",
+            "elapsed_sec": 10.0,
+            "stage_timings": {"vlm_sec": 4.0, "store_sec": 0.7},
+            "quality_metrics": {
+                "captions_fallback_ratio": 0.3,
+                "captions_static_ratio": 0.25,
+                "keyframes_kept": 40,
+            },
+        },
+    ]
+
+    resp = mocks["client"].get("/video/vbench/benchmark/trend?limit=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["video_id"] == "vbench"
+    assert body["run_count"] == 2
+    assert body["elapsed_sec"]["delta_latest_minus_oldest"] == -2.0
+    assert body["stage_timing_delta"]["vlm_sec"] == -0.5
+
+
+def test_benchmark_trend_404_when_insufficient_runs(mocks):
+    """Trend endpoint requires at least two runs."""
+    mocks["db"].get_video.return_value = _make_meta(video_id="vbench", status=VideoStatus.PROCESSED)
+    mocks["db"].list_benchmark_runs.return_value = [{"id": "only", "video_id": "vbench"}]
+
+    resp = mocks["client"].get("/video/vbench/benchmark/trend?limit=2")
+    assert resp.status_code == 404
+    assert "at least 2 benchmark runs" in resp.json()["detail"]
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 3. GET /video/{id}/thumbnail
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
