@@ -79,3 +79,14 @@ cogni/
 # NVIDIA / Secrets
 .nvidia-api-key
 *.nvapi
+
+# Nested repo copies
+gitfolder/
+branch2/
+
+# Saved webpages (root level only, not frontend/index.html)
+/*.html
+*_files/
+
+# Claude Code settings
+.claude/
