@@ -193,6 +193,45 @@ class PipelineOrchestrator:
                 transcripts = whisper_future.result()
                 self._emit(progress, 5, "Audio transcription complete")
 
+            # ── Stage 6b: NVCLIP image embeddings (when NVIDIA available) ─
+            from backend.providers.nvidia import nvidia
+            nvclip_segments: list[FusedSegment] = []
+            if nvidia.available and keyframes:
+                self._emit(progress, 5, "NVCLIP image embeddings")
+                import uuid as _uuid
+                image_paths = [kf.file_path for kf in keyframes]
+                clip_vectors = nvidia.embed_images(image_paths)
+                if clip_vectors:
+                    for kf, vec in zip(keyframes, clip_vectors):
+                        nvclip_segments.append(FusedSegment(
+                            id=_uuid.uuid4().hex,
+                            video_id=meta.id,
+                            start_time=kf.timestamp,
+                            end_time=kf.timestamp + 1.0,
+                            text=f"[image] keyframe at {kf.timestamp:.1f}s",
+                            source_type="visual",
+                            frame_path=kf.file_path,
+                            embedding=vec,
+                        ))
+                    logger.info("NVCLIP: %d image embeddings created", len(nvclip_segments))
+
+            # ── Stage 6c: Grounding DINO object detection (when NVIDIA available) ─
+            if nvidia.available and keyframes:
+                self._emit(progress, 5, "Object detection (Grounding DINO)")
+                common_objects = ["person", "car", "vehicle", "building", "animal", "bag", "phone"]
+                for kf in keyframes[:20]:  # Limit to first 20 keyframes for speed
+                    detections = nvidia.detect_objects(kf.file_path, common_objects)
+                    if detections:
+                        det_text = ", ".join(
+                            f"{d['label']} ({d['confidence']:.0%})"
+                            for d in detections
+                        )
+                        # Enrich captions with detection info
+                        for cap in captions:
+                            if cap.keyframe.frame_number == kf.frame_number:
+                                cap.objects = list(set(cap.objects + [d["label"] for d in detections]))
+                                break
+
             # ── Stage 7: Fusion & embedding ────────────────────
             self._emit(progress, 6, "Multimodal fusion")
             fused: list = []
@@ -203,6 +242,10 @@ class PipelineOrchestrator:
             else:
                 embedder = MultimodalEmbedder()
                 fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
+
+            # Add NVCLIP image segments (already have embeddings, skip re-embedding)
+            if nvclip_segments:
+                fused.extend(nvclip_segments)
 
             # ── Stage 8: Knowledge graph ───────────────────────
             self._emit(progress, 7, "Knowledge graph")
@@ -254,6 +297,16 @@ class PipelineOrchestrator:
                 "Pipeline complete: video=%s, segments=%d, events=%d, time=%.1fs",
                 meta.id, result.segments_stored, result.events_detected, elapsed,
             )
+
+            # Fire webhook notification
+            from backend.webhooks import fire_webhook
+            fire_webhook("video_processed", {
+                "video_id": meta.id,
+                "filename": meta.filename,
+                "segments_stored": result.segments_stored,
+                "events_detected": result.events_detected,
+                "elapsed_sec": result.elapsed_sec,
+            })
 
         except Exception as exc:
             msg = f"Pipeline failed: {exc}"

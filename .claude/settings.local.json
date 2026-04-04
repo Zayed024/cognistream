@@ -38,7 +38,8 @@
       "Bash(ollama show:*)",
       "Bash(taskkill:*)",
       "WebFetch(domain:build.nvidia.com)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(npx vitest:*)"
     ]
   }
 }

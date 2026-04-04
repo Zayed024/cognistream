@@ -67,12 +67,22 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 # Embeddings (Multimodal Fusion)
 # ──────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 384  # local model dimension
+
+# When NVIDIA is enabled, embeddings are 1024-dim (NV-EmbedQA-E5-V5).
+# ChromaDB collections are dimension-locked, so we use a separate
+# collection name to avoid conflicts when switching providers.
+NVIDIA_EMBEDDING_DIM = 1024
 
 # ──────────────────────────────────────────────
 # ChromaDB
 # ──────────────────────────────────────────────
-CHROMA_COLLECTION = "cognistream_segments"
+# Collection name auto-switches when NVIDIA is enabled to avoid dimension conflicts.
+# Local embeddings (384-dim) and NVIDIA embeddings (1024-dim) can't share a collection.
+CHROMA_COLLECTION = os.getenv(
+    "CHROMA_COLLECTION",
+    "cognistream_nvidia" if os.getenv("NVIDIA_API_KEY", "") else "cognistream_segments",
+)
 # When running in Docker, ChromaDB is a separate service.
 # Set CHROMA_HOST to enable HTTP client mode instead of embedded.
 CHROMA_HOST = os.getenv("CHROMA_HOST", "")  # empty = embedded/persistent mode
@@ -103,6 +113,10 @@ PIPELINE_MODE = os.getenv("PIPELINE_MODE", "fast")
 # Streaming / live-video chunk size in seconds
 STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
 
+# Live feed segment TTL — auto-delete segments older than this (hours).
+# 0 = keep forever (default for file-based processing).
+LIVE_SEGMENT_TTL_HOURS = int(os.getenv("LIVE_SEGMENT_TTL_HOURS", "24"))
+
 # ──────────────────────────────────────────────
 # NVIDIA NIM Cloud (optional — set API key to enable)
 # When enabled, NVIDIA models are used for higher quality.
@@ -123,6 +137,25 @@ NVIDIA_GROUNDING_URL = os.getenv("NVIDIA_GROUNDING_URL", "https://ai.api.nvidia.
 def is_nvidia_enabled() -> bool:
     """True if NVIDIA cloud mode is active (API key provided)."""
     return bool(NVIDIA_API_KEY)
+
+# ──────────────────────────────────────────────
+# Security
+# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Webhooks — notify external systems on events
+# ──────────────────────────────────────────────
+# Comma-separated list of URLs to POST event payloads to.
+# Empty = disabled.  Events: video_processed, event_detected, live_chunk_ready
+WEBHOOK_URLS = [u.strip() for u in os.getenv("WEBHOOK_URLS", "").split(",") if u.strip()]
+
+# Optional API key authentication.  Set to enable — requests must include
+# header "X-API-Key: <key>".  Empty = no auth (default for local dev).
+# Supports multiple comma-separated keys for multi-user setups.
+API_KEY = os.getenv("COGNISTREAM_API_KEY", "")
+API_KEYS: set[str] = {k.strip() for k in API_KEY.split(",") if k.strip()}
+
+# Rate limiting (requests per minute per IP)
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 
 # ──────────────────────────────────────────────
 # Logging

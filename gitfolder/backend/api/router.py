@@ -242,6 +242,51 @@ async def health():
     }
 
 
+@router.get("/stats")
+async def get_stats():
+    """Dashboard analytics — processing stats, model info, system status."""
+    from backend.providers.nvidia import nvidia
+    from backend.config import (
+        OLLAMA_MODEL, WHISPER_MODEL_SIZE, EMBEDDING_MODEL,
+        PIPELINE_MODE, LIVE_SEGMENT_TTL_HOURS,
+    )
+
+    videos = _db.list_videos()
+    total_segments = _store.count()
+    live_feeds = _streaming_pipeline.get_live_status()
+
+    status_counts = {}
+    for v in videos:
+        s = v.status.value
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    total_duration = sum(v.duration_sec or 0 for v in videos)
+
+    return {
+        "videos": {
+            "total": len(videos),
+            "by_status": status_counts,
+            "total_duration_sec": round(total_duration, 1),
+            "total_duration_human": f"{total_duration / 3600:.1f}h" if total_duration > 3600 else f"{total_duration / 60:.1f}m",
+        },
+        "segments": {
+            "total": total_segments,
+        },
+        "live_feeds": {
+            "active": len([f for f in live_feeds if f.state == "running"]),
+            "total": len(live_feeds),
+        },
+        "config": {
+            "pipeline_mode": PIPELINE_MODE,
+            "nvidia_cloud": nvidia.available,
+            "vlm_model": "nvidia" if nvidia.available else OLLAMA_MODEL,
+            "stt_model": "nvidia/parakeet" if nvidia.available else f"whisper-{WHISPER_MODEL_SIZE}",
+            "embedding_model": "nvidia/nv-embed" if nvidia.available else EMBEDDING_MODEL,
+            "live_ttl_hours": LIVE_SEGMENT_TTL_HOURS,
+        },
+    }
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Video ingestion
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -713,6 +758,75 @@ async def export_clip(video_id: str, req: ClipRequest):
     except Exception as exc:
         clip_path.unlink(missing_ok=True)
         raise HTTPException(500, f"Clip export failed: {exc}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Video summary report
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/video/{video_id}/report")
+async def get_video_report(video_id: str):
+    """Generate a structured summary report for a processed video.
+
+    Returns metadata, segment stats, top entities, detected events,
+    and a timeline of key moments — useful for dashboards and exports.
+    """
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    # Segment stats from ChromaDB
+    segments = _store.get_by_video(video_id)
+    source_counts = {}
+    for seg in segments:
+        st = seg.get("source_type", "unknown")
+        source_counts[st] = source_counts.get(st, 0) + 1
+
+    # Events from DB
+    events = _db.list_events(video_id)
+
+    # Knowledge graph summary
+    graph_path = GRAPH_DIR / f"{video_id}.graphml"
+    entities = []
+    if graph_path.is_file():
+        import networkx as nx
+        G = nx.read_graphml(str(graph_path))
+        # Top entities by occurrence count
+        for node_id, data in G.nodes(data=True):
+            entities.append({
+                "label": data.get("label", node_id),
+                "type": data.get("type", "object"),
+                "count": int(float(data.get("count", 1))),
+            })
+        entities.sort(key=lambda e: e["count"], reverse=True)
+
+    # Annotations
+    annotations = _db.list_annotations(video_id)
+
+    return {
+        "video_id": video_id,
+        "filename": meta.filename,
+        "duration_sec": meta.duration_sec,
+        "status": meta.status.value,
+        "created_at": meta.created_at,
+        "processed_at": meta.processed_at,
+        "segments": {
+            "total": len(segments),
+            "by_source": source_counts,
+        },
+        "events": {
+            "total": len(events),
+            "items": events[:20],  # Top 20 events
+        },
+        "entities": {
+            "total": len(entities),
+            "top": entities[:30],  # Top 30 entities
+        },
+        "annotations": {
+            "total": len(annotations),
+            "items": annotations,
+        },
+    }
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

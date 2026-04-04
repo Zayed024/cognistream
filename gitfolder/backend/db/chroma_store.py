@@ -270,14 +270,44 @@ class ChromaStore:
     # Helpers
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+    def purge_expired(self, ttl_hours: int) -> int:
+        """Delete segments older than ``ttl_hours``.
+
+        Uses the ``indexed_at`` metadata field (epoch seconds).
+        Returns the number of segments deleted.
+        """
+        if ttl_hours <= 0:
+            return 0
+
+        import time
+        collection = self._get_collection()
+        cutoff = time.time() - (ttl_hours * 3600)
+
+        try:
+            old = collection.get(
+                where={"indexed_at": {"$lt": cutoff}},
+                include=[],
+            )
+            if not old["ids"]:
+                return 0
+
+            collection.delete(ids=old["ids"])
+            logger.info("Purged %d expired segments (TTL=%dh).", len(old["ids"]), ttl_hours)
+            return len(old["ids"])
+        except Exception as exc:
+            logger.debug("TTL purge skipped: %s", exc)
+            return 0
+
     @staticmethod
     def _segment_metadata(seg: FusedSegment) -> dict:
         """Build the metadata dict stored alongside each vector."""
+        import time
         meta = {
             "video_id": seg.video_id,
             "start_time": seg.start_time,
             "end_time": seg.end_time,
             "source_type": seg.source_type,
+            "indexed_at": time.time(),
         }
         if seg.frame_path:
             meta["frame_path"] = seg.frame_path
