@@ -1027,6 +1027,28 @@ async def get_graph(video_id: str):
             "timestamp": float(data.get("timestamp", 0)),
         })
 
+    # Older graphs may contain entity nodes without persisted edges.
+    # Synthesize lightweight co-occurrence links from shared timestamps so
+    # the frontend can still show relationships for already-processed videos.
+    if not edges and len(nodes) > 1:
+        grouped_nodes: dict[float, list[str]] = {}
+        for node in nodes:
+            ts = round(float(node.get("first_seen", 0)), 3)
+            grouped_nodes.setdefault(ts, []).append(node["id"])
+
+        for timestamp, node_ids in grouped_nodes.items():
+            unique_ids = list(dict.fromkeys(node_ids))
+            if len(unique_ids) < 2:
+                continue
+            for i, src in enumerate(unique_ids[:-1]):
+                for tgt in unique_ids[i + 1:]:
+                    edges.append({
+                        "source": src,
+                        "target": tgt,
+                        "action": "co_occurs_with",
+                        "timestamp": timestamp,
+                    })
+
     return {"nodes": nodes, "edges": edges}
 
 

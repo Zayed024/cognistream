@@ -1,28 +1,13 @@
 import { useEffect, useState } from "react";
-import axios from "axios";
-
-const api = axios.create({ baseURL: "/api", timeout: 10000 });
-
-interface Stats {
-  videos: { total: number; by_status: Record<string, number>; total_duration_human: string };
-  segments: { total: number };
-  live_feeds: { active: number; total: number };
-  config: {
-    pipeline_mode: string;
-    nvidia_cloud: boolean;
-    vlm_model: string;
-    stt_model: string;
-    embedding_model: string;
-  };
-}
+import { getStats, type Stats } from "../api/client";
 
 export default function StatsPanel() {
   const [stats, setStats] = useState<Stats | null>(null);
 
   useEffect(() => {
-    api.get<Stats>("/stats").then((r) => setStats(r.data)).catch(() => {});
+    getStats().then(setStats).catch(() => {});
     const interval = setInterval(() => {
-      api.get<Stats>("/stats").then((r) => setStats(r.data)).catch(() => {});
+      getStats().then(setStats).catch(() => {});
     }, 15000);
     return () => clearInterval(interval);
   }, []);

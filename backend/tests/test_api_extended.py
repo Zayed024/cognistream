@@ -558,6 +558,29 @@ def test_graph_with_graphml(mocks):
     assert edge["action"] == "approaches"
 
 
+def test_graph_synthesizes_relationships_when_graph_has_only_nodes(mocks):
+    """Graph endpoint infers lightweight edges for legacy node-only GraphML files."""
+    import networkx as nx
+
+    mocks["db"].get_video.return_value = _make_meta(video_id="v_legacy_graph")
+
+    G = nx.DiGraph()
+    G.add_node("car", label="car", type="vehicle", count=2, first_seen=1.0, last_seen=4.0)
+    G.add_node("traffic_light", label="traffic_light", type="object", count=1, first_seen=1.0, last_seen=1.0)
+    G.add_node("pedestrian", label="pedestrian", type="person", count=1, first_seen=5.0, last_seen=5.0)
+
+    graph_path = mocks["config"].GRAPH_DIR / "v_legacy_graph.graphml"
+    nx.write_graphml(G, str(graph_path))
+
+    resp = mocks["client"].get("/video/v_legacy_graph/graph")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["edges"]) == 1
+    assert body["edges"][0]["source"] == "car"
+    assert body["edges"][0]["target"] == "traffic_light"
+    assert body["edges"][0]["action"] == "co_occurs_with"
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 7. GET /video/{id}/events
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

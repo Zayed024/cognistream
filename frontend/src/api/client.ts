@@ -1,29 +1,159 @@
-import axios from "axios";
 import type {
   SearchRequest, SearchResponse, VideoMeta, VideoListResponse,
   GraphData, VideoEvent, Annotation, SearchResult,
 } from "../types";
 
-const api = axios.create({
-  baseURL: "/api",
-  timeout: 30000,
-  headers: { "Content-Type": "application/json" },
-});
+const API_BASE_URL = "/api";
+const DEFAULT_TIMEOUT = 30000;
+
+async function request<T>(
+  path: string,
+  options: RequestInit & { timeout?: number } = {}
+): Promise<T> {
+  const { timeout = DEFAULT_TIMEOUT, headers, ...init } = options;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      headers: {
+        Accept: "application/json",
+        ...headers,
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(await getErrorMessage(response));
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    return response.json() as Promise<T>;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function requestBlob(
+  path: string,
+  options: RequestInit & { timeout?: number } = {}
+): Promise<Blob> {
+  const { timeout = DEFAULT_TIMEOUT, ...init } = options;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(await getErrorMessage(response));
+    }
+
+    return await response.blob();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+async function getErrorMessage(response: Response): Promise<string> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const data = await response.json().catch(() => null) as
+      | { detail?: string; message?: string }
+      | null;
+    if (data?.detail) return data.detail;
+    if (data?.message) return data.message;
+  }
+
+  const text = await response.text().catch(() => "");
+  return text || `${response.status} ${response.statusText}`.trim();
+}
+
+function uploadFormData<T>(
+  path: string,
+  formData: FormData,
+  options: {
+    timeout?: number;
+    onProgress?: (percent: number) => void;
+  } = {}
+): Promise<T> {
+  const { timeout = DEFAULT_TIMEOUT, onProgress } = options;
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE_URL}${path}`);
+    xhr.timeout = timeout;
+    xhr.responseType = "json";
+    xhr.setRequestHeader("Accept", "application/json");
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response as T);
+        return;
+      }
+
+      const fallback = xhr.statusText || `HTTP ${xhr.status}`;
+      const response = xhr.response as { detail?: string; message?: string } | null;
+      reject(new Error(response?.detail || response?.message || fallback));
+    };
+
+    xhr.onerror = () => reject(new Error("Network error"));
+    xhr.ontimeout = () => reject(new Error("Request timed out"));
+    xhr.send(formData);
+  });
+}
 
 // ── Search ──────────────────────────────────────────────────
 
 export async function searchVideos(
   request: SearchRequest
 ): Promise<SearchResponse> {
-  const { data } = await api.post<SearchResponse>("/search", request);
-  return data;
+  return requestJson("/search", request);
+}
+
+async function requestJson<T>(
+  path: string,
+  body?: unknown,
+  options: Omit<RequestInit, "body"> & { timeout?: number } = {}
+): Promise<T> {
+  return request<T>(path, {
+    method: body === undefined ? "GET" : "POST",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers ?? {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
 }
 
 // ── Video CRUD ──────────────────────────────────────────────
 
 export async function getVideoMeta(videoId: string): Promise<VideoMeta> {
-  const { data } = await api.get<VideoMeta>(`/video/${videoId}`);
-  return data;
+  return request<VideoMeta>(`/video/${videoId}`);
 }
 
 export function getVideoStreamUrl(videoId: string): string {
@@ -39,7 +169,7 @@ export function getThumbnailUrl(videoId: string): string {
 }
 
 export async function listVideos(): Promise<VideoMeta[]> {
-  const { data } = await api.get<VideoListResponse>("/videos");
+  const data = await request<VideoListResponse>("/videos");
   return data.videos;
 }
 
@@ -50,24 +180,18 @@ export async function uploadVideo(
   const formData = new FormData();
   formData.append("file", file);
 
-  const { data } = await api.post("/ingest-video", formData, {
-    headers: { "Content-Type": "multipart/form-data" },
+  return uploadFormData("/ingest-video", formData, {
     timeout: 600000,
-    onUploadProgress: (event) => {
-      if (event.total && onProgress) {
-        onProgress(Math.round((event.loaded / event.total) * 100));
-      }
-    },
+    onProgress,
   });
-  return data;
 }
 
 export async function processVideo(videoId: string): Promise<void> {
-  await api.post("/process-video", { video_id: videoId });
+  await requestJson("/process-video", { video_id: videoId });
 }
 
 export async function deleteVideo(videoId: string): Promise<void> {
-  await api.delete(`/video/${videoId}`);
+  await request<void>(`/video/${videoId}`, { method: "DELETE" });
 }
 
 // ── Batch processing ────────────────────────────────────────
@@ -77,8 +201,7 @@ export async function processBatch(videoIds: string[]): Promise<{
   queue_size: number;
   errors: { video_id: string; error: string }[];
 }> {
-  const { data } = await api.post("/process-batch", { video_ids: videoIds });
-  return data;
+  return requestJson("/process-batch", { video_ids: videoIds });
 }
 
 export async function getProcessQueue(): Promise<{
@@ -86,8 +209,7 @@ export async function getProcessQueue(): Promise<{
   queue_size: number;
   is_busy: boolean;
 }> {
-  const { data } = await api.get("/process-queue");
-  return data;
+  return request("/process-queue");
 }
 
 // ── Progress SSE ────────────────────────────────────────────
@@ -104,8 +226,7 @@ export interface VideoProgress {
 }
 
 export async function getVideoProgress(videoId: string): Promise<VideoProgress> {
-  const { data } = await api.get<VideoProgress>(`/video/${videoId}/progress`);
-  return data;
+  return request<VideoProgress>(`/video/${videoId}/progress`);
 }
 
 export function subscribeToProgress(
@@ -142,7 +263,7 @@ export async function findSimilar(
   topK = 10,
   videoId?: string
 ): Promise<SearchResult[]> {
-  const { data } = await api.post<{ results: SearchResult[] }>("/similar", {
+  const data = await requestJson<{ results: SearchResult[] }>("/similar", {
     segment_id: segmentId,
     top_k: topK,
     video_id: videoId,
@@ -154,8 +275,8 @@ export async function findSimilar(
 
 export function getClipExportUrl(
   videoId: string,
-  startTime: number,
-  endTime: number
+  _startTime: number,
+  _endTime: number
 ): string {
   // We'll POST to get the clip, but for direct download we need a form submit
   return `/api/video/${videoId}/clip`;
@@ -166,19 +287,20 @@ export async function exportClip(
   startTime: number,
   endTime: number
 ): Promise<Blob> {
-  const { data } = await api.post(
-    `/video/${videoId}/clip`,
-    { start_time: startTime, end_time: endTime },
-    { responseType: "blob", timeout: 120000 }
-  );
-  return data;
+  return requestBlob(`/video/${videoId}/clip`, {
+    method: "POST",
+    timeout: 120000,
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ start_time: startTime, end_time: endTime }),
+  });
 }
 
 // ── Knowledge graph ─────────────────────────────────────────
 
 export async function getVideoGraph(videoId: string): Promise<GraphData> {
-  const { data } = await api.get<GraphData>(`/video/${videoId}/graph`);
-  return data;
+  return request<GraphData>(`/video/${videoId}/graph`);
 }
 
 // ── Events ──────────────────────────────────────────────────
@@ -186,18 +308,14 @@ export async function getVideoGraph(videoId: string): Promise<GraphData> {
 export async function getVideoEvents(
   videoId: string
 ): Promise<VideoEvent[]> {
-  const { data } = await api.get<{ events: VideoEvent[] }>(
-    `/video/${videoId}/events`
-  );
+  const data = await request<{ events: VideoEvent[] }>(`/video/${videoId}/events`);
   return data.events;
 }
 
 // ── Annotations ─────────────────────────────────────────────
 
 export async function getAnnotations(videoId: string): Promise<Annotation[]> {
-  const { data } = await api.get<{ annotations: Annotation[] }>(
-    `/video/${videoId}/annotations`
-  );
+  const data = await request<{ annotations: Annotation[] }>(`/video/${videoId}/annotations`);
   return data.annotations;
 }
 
@@ -209,12 +327,32 @@ export async function createAnnotation(ann: {
   note?: string;
   color?: string;
 }): Promise<Annotation> {
-  const { data } = await api.post<Annotation>("/annotations", ann);
-  return data;
+  return requestJson<Annotation>("/annotations", ann);
 }
 
 export async function deleteAnnotation(annotationId: string): Promise<void> {
-  await api.delete(`/annotations/${annotationId}`);
+  await request<void>(`/annotations/${annotationId}`, { method: "DELETE" });
+}
+
+export interface Stats {
+  videos: {
+    total: number;
+    by_status: Record<string, number>;
+    total_duration_human: string;
+  };
+  segments: { total: number };
+  live_feeds: { active: number; total: number };
+  config: {
+    pipeline_mode: string;
+    nvidia_cloud: boolean;
+    vlm_model: string;
+    stt_model: string;
+    embedding_model: string;
+  };
+}
+
+export async function getStats(): Promise<Stats> {
+  return request<Stats>("/stats", { timeout: 10000 });
 }
 
 // ── Live feeds ──────────────────────────────────────────────
@@ -243,23 +381,21 @@ export async function startLiveFeed(
   videoId: string,
   chunkSec = 15
 ): Promise<{ video_id: string; state: string; message: string }> {
-  const { data } = await api.post("/live/start", {
+  return requestJson("/live/start", {
     url,
     video_id: videoId,
     chunk_sec: chunkSec,
   });
-  return data;
 }
 
 export async function stopLiveFeed(
   videoId: string
 ): Promise<{ video_id: string; message: string }> {
-  const { data } = await api.post("/live/stop", { video_id: videoId });
-  return data;
+  return requestJson("/live/stop", { video_id: videoId });
 }
 
 export async function getLiveFeedStatus(): Promise<LiveFeedInfo[]> {
-  const { data } = await api.get<{ feeds: LiveFeedInfo[] }>("/live/status");
+  const data = await request<{ feeds: LiveFeedInfo[] }>("/live/status");
   return data.feeds;
 }
 
@@ -306,19 +442,22 @@ export async function uploadBrowserChunk(
   const formData = new FormData();
   formData.append("file", blob, `chunk_${chunkIndex}.webm`);
 
-  const { data } = await api.post(
+  return request(
     `/live/browser-chunk?video_id=${encodeURIComponent(videoId)}&chunk_index=${chunkIndex}&chunk_start=${chunkStart}`,
-    formData,
-    { headers: { "Content-Type": "multipart/form-data" }, timeout: 120000 }
+    {
+      method: "POST",
+      body: formData,
+      timeout: 120000,
+    }
   );
-  return data;
 }
 
 export async function stopBrowserFeed(
   videoId: string
 ): Promise<{ total_chunks: number; message: string }> {
-  const { data } = await api.post(
-    `/live/browser-stop?video_id=${encodeURIComponent(videoId)}`
+  return requestJson(
+    `/live/browser-stop?video_id=${encodeURIComponent(videoId)}`,
+    undefined,
+    { method: "POST" }
   );
-  return data;
 }

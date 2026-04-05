@@ -38,7 +38,7 @@ class TestKnowledgeGraphRelationships:
     def test_add_relationship(self, graph):
         graph.add_relationship("red_car", "traffic_signal", "stops_at", 34.2)
         assert graph.G.has_edge("red_car", "traffic_signal")
-        edge = graph.G.edges["red_car", "traffic_signal"]
+        edge = next(iter(graph.G.get_edge_data("red_car", "traffic_signal").values()))
         assert edge["action"] == "stops_at"
         assert edge["timestamp"] == 34.2
 
@@ -63,6 +63,14 @@ class TestKnowledgeGraphRelationships:
         entities = {r["entity"] for r in related}
         assert "signal" in entities
         assert "person" in entities
+
+    def test_preserves_multiple_temporal_edges_between_same_entities(self, graph):
+        graph.add_relationship("red_car", "signal", "approaching", 30.0)
+        graph.add_relationship("red_car", "signal", "stopping", 34.0)
+        edge_data = graph.G.get_edge_data("red_car", "signal")
+        assert edge_data is not None
+        actions = sorted(data["action"] for data in edge_data.values())
+        assert actions == ["approaching", "stopping"]
 
 
 class TestKnowledgeGraphPersistence:
@@ -118,11 +126,15 @@ class TestKnowledgeGraphBuildFromCaptions:
 
     def test_builds_edges_from_activities(self, graph, sample_captions, sample_transcripts):
         graph.build_from_captions(sample_captions, sample_transcripts)
-        # At least some edges should exist from activity extraction
-        assert graph.G.number_of_edges() >= 0  # may be 0 if no verbs match
+        assert graph.G.number_of_edges() > 0
 
     def test_limits_transcript_keywords(self, graph, sample_captions, sample_transcripts):
         """Only top 3 keywords per segment should become nodes."""
         graph.build_from_captions(sample_captions, sample_transcripts)
         # We can't easily count exact keyword nodes, but the graph shouldn't explode
         assert graph.G.number_of_nodes() < 50
+
+    def test_builds_keyword_relationships_from_transcripts(self, graph, sample_transcripts):
+        graph.build_from_captions([], sample_transcripts)
+        related = graph.get_related_entities("car")
+        assert any(item["entity"] == "traffic" and item["action"] == "mentioned_with" for item in related)
