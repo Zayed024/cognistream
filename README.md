@@ -1,245 +1,227 @@
 # CogniStream
 
-Privacy-preserving multimodal video retrieval engine. Search video content with natural language queries like *"Show me when the red car arrived"* — entirely offline, no cloud APIs.
+Privacy-preserving multimodal video retrieval engine. Search video content with natural language queries like *"Show me when the red car arrived"* — runs fully offline on edge hardware, with optional NVIDIA cloud acceleration.
+
+## Features
+
+- **Natural language video search** — query with text, find matching video moments
+- **Live video feeds** — RTSP cameras, webcams, phone browsers, screen share
+- **Multi-model pipeline** — VLM scene analysis + speech transcription + visual embeddings
+- **Knowledge graph** — entity relationships + temporal event detection
+- **Real-time processing** — streaming chunk pipeline, segments searchable within seconds
+- **Multi-vector retrieval** — text + visual + audio embeddings with configurable weights
+- **NVIDIA NIM cloud** — optional higher-quality models via API (Llama-3.2-11B, NV-Embed, NVCLIP)
+- **Dashboard** — stats panel, live feed monitor, video reports
+- **Security** — API key auth, rate limiting, multi-user support
 
 ## How It Works
 
-CogniStream processes videos through a 10-stage pipeline:
-
-1. **Shot detection** — HSV histogram correlation finds scene boundaries
-2. **Frame sampling** — Adaptive keyframe extraction (budget per shot, max 200)
-3. **Audio extraction** — FFmpeg pulls 16kHz mono WAV
-4. **Visual analysis** — Local VLM (Moondream2 via Ollama) describes each keyframe in 4 passes: scene, objects, activity, anomaly
-5. **Transcription** — Faster-Whisper (int8, CPU) produces timestamped speech segments with TF-IDF keywords
-6. **Multimodal fusion** — Visual captions + transcripts merged by temporal overlap, each transcript assigned to nearest keyframe
-7. **Embedding** — SentenceTransformers (`all-MiniLM-L6-v2`, 384-dim) encodes fused text
-8. **Knowledge graph** — NetworkX directed graph of entities + temporal relationships
-9. **Event detection** — Pattern matching over graph edges (car arrival, building entry, suspicious activity, etc.)
-10. **Vector storage** — ChromaDB stores embeddings with metadata for cosine similarity search
-
-Queries hit a 4-stage retrieval pipeline: embed query → ChromaDB search (2x overfetch) → temporal re-ranking (Gaussian decay) → format results.
-
-## Architecture
+Videos are processed through a multi-stage pipeline with parallel execution:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Frontend (React)                      │
-│   SearchBar → ResultsPanel → VideoPlayer + Timeline      │
-└────────────────────────┬────────────────────────────────┘
-                         │ REST API
-┌────────────────────────▼────────────────────────────────┐
-│                 Backend (FastAPI)                         │
-│                                                          │
-│  Ingestion ──► Visual ──► Audio ──► Fusion ──► Storage   │
-│  loader        vlm_runner  extractor  embedder  chroma   │
-│  shot_detect   caption     whisper    graph     sqlite   │
-│  frame_sample              keywords   events             │
-│                                                          │
-│  Retrieval: query_engine (embed → search → rerank)       │
-└──────┬──────────────┬───────────────────────────────────┘
-       │              │
-  ┌────▼────┐   ┌─────▼─────┐
-  │ Ollama  │   │ ChromaDB  │
-  │ VLM     │   │ Vectors   │
-  └─────────┘   └───────────┘
+Video → Shot Detection ──→ Frame Sampling ──┐
+        Audio Extraction ───────────────────┤ (parallel)
+                                            ├→ VLM Analysis (N workers) ──┐
+                                            └→ Whisper STT ──────────────┤ (parallel or sequential GPU swap)
+                                                                         ├→ SigLIP Frame Embeddings
+                                                                         ├→ Multimodal Fusion
+                                                                         ├→ Text Embedding
+                                                                         ├→ Knowledge Graph + Events
+                                                                         └→ ChromaDB Storage
 ```
+
+Search uses a 4-stage retrieval pipeline: embed query → multi-vector search (text + visual) → temporal re-ranking → hybrid re-ranking.
+
+## Models
+
+| Component | Local (Default) | NVIDIA Cloud (Optional) |
+|-----------|----------------|------------------------|
+| **VLM** | moondream (1.8B, GPU) | Llama-3.2-11B-Vision |
+| **STT** | Whisper large-v3-turbo (GPU) | Parakeet ASR |
+| **Text Embeddings** | all-MiniLM-L6-v2 (384-dim) | NV-EmbedQA-E5 (1024-dim) |
+| **Visual Embeddings** | SigLIP 2 (768-dim) | NVCLIP (1024-dim) |
+| **Object Detection** | — | NV-Grounding-DINO |
+
+The pipeline auto-detects model capabilities and adjusts (4-pass prompts for small VLMs, single-pass for larger ones).
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+, Node.js 20+, FFmpeg
+- [Ollama](https://ollama.com/) installed
+- NVIDIA GPU recommended (RTX 3050+ with 6GB VRAM)
+
+### Setup
+
+```bash
+# Clone
+git clone https://github.com/Zayed024/cognistream.git && cd cognistream
+
+# Install Python deps
+pip install -r requirements.txt
+
+# Pull VLM model
+ollama pull moondream
+
+# Install frontend
+cd frontend && npm install && cd ..
+
+# Copy and edit config
+cp .env.example .env
+```
+
+### Run
+
+```bash
+# Terminal 1: Ollama
+ollama serve
+
+# Terminal 2: Backend
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 3: Frontend
+cd frontend && npm run dev
+```
+
+Open http://localhost:3000
+
+### Docker
+
+```bash
+cd docker && docker compose up --build
+```
+
+## API Reference
+
+### Core
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/ingest-video` | Upload video (streaming, max 2 GB) |
+| `POST` | `/process-video` | Process video (`standard` or `streaming` mode) |
+| `POST` | `/search` | Natural language search |
+| `GET` | `/videos` | List all videos |
+| `GET` | `/video/{id}` | Video metadata + status |
+| `GET` | `/video/{id}/stream` | Stream video file |
+| `GET` | `/video/{id}/report` | Full video summary report |
+| `DELETE` | `/video/{id}` | Delete video + all data |
+
+### Live Video
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/live/start` | Start RTSP/webcam/HTTP feed |
+| `POST` | `/live/stop` | Stop a live feed |
+| `GET` | `/live/status` | List active feeds |
+| `WS` | `/ws/live/{id}` | Real-time events + live search |
+| `POST` | `/live/browser-chunk` | Upload browser camera chunk |
+| `POST` | `/live/browser-stop` | Finalize browser feed |
+
+### Features
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/similar` | Find similar segments |
+| `POST` | `/video/{id}/clip` | Export video clip (FFmpeg) |
+| `GET` | `/video/{id}/graph` | Knowledge graph (nodes + edges) |
+| `GET` | `/video/{id}/events` | Detected events timeline |
+| `GET` | `/video/{id}/thumbnail` | Video thumbnail |
+| `POST` | `/annotations` | Create annotation/bookmark |
+| `GET` | `/video/{id}/annotations` | List annotations |
+| `POST` | `/process-batch` | Queue multiple videos |
+| `GET` | `/stats` | Dashboard analytics |
+| `GET` | `/health` | Health check + provider status |
 
 ## Project Structure
 
 ```
 cognistream/
 ├── backend/
-│   ├── main.py                 # FastAPI entrypoint
-│   ├── config.py               # Central configuration
-│   ├── api/router.py           # REST endpoints
+│   ├── main.py                 # FastAPI app + middleware (auth, rate limit)
+│   ├── config.py               # Central config + hardware auto-tuning
+│   ├── api/router.py           # 32 REST + WebSocket endpoints
 │   ├── ingestion/              # Video loader, shot detector, frame sampler
-│   ├── visual/                 # Ollama VLM runner, caption processor
-│   ├── audio/                  # FFmpeg extractor, Faster-Whisper runner
+│   ├── visual/                 # VLM runner, caption processor, SigLIP embedder
+│   ├── audio/                  # FFmpeg extractor, Whisper runner (GPU)
 │   ├── fusion/                 # Multimodal embedder (fusion + encoding)
 │   ├── knowledge/              # Knowledge graph, event detector
-│   ├── retrieval/              # Query engine (search + re-rank)
-│   ├── pipeline/               # Orchestrator (wires all stages)
-│   └── db/                     # SQLite + ChromaDB wrappers
+│   ├── retrieval/              # Query engine (multi-vector + temporal rerank)
+│   ├── pipeline/               # Orchestrator + streaming pipeline
+│   ├── providers/nvidia.py     # NVIDIA NIM cloud (NVCLIP, NV-Embed, VLM, ASR)
+│   ├── webhooks.py             # Event notifications
+│   ├── db/                     # SQLite + ChromaDB wrappers
+│   └── tests/                  # 331 tests (21 test files)
 ├── frontend/
 │   └── src/
-│       ├── components/         # SearchBar, VideoPlayer, ResultsPanel, TimelineMarkers
+│       ├── components/         # 10 components + 3 test files
+│       │   ├── SearchBar, VideoPlayer, ResultsPanel, TimelineMarkers
+│       │   ├── VideoList, VideoUpload, KnowledgeGraph, EventTimeline
+│       │   ├── LiveView (URL/camera/screen), StatsPanel
+│       │   └── __tests__/      # Vitest + React Testing Library
 │       ├── hooks/              # useSearch, useVideo
-│       ├── api/client.ts       # Axios HTTP client
+│       ├── api/client.ts       # Typed API client (fetch-based)
 │       └── types/index.ts      # TypeScript interfaces
-├── docker/
-│   ├── docker-compose.yml      # 4 services with resource limits
-│   ├── Dockerfile.backend
-│   ├── Dockerfile.frontend
-│   ├── nginx.conf
-│   └── ollama-entrypoint.sh
-├── scripts/pull_models.sh      # Pre-download models for offline use
-├── scripts/benchmark_local.py  # Query diversity + stage timing benchmark helper
+├── docker/                     # Docker Compose (4 services)
+├── scripts/                    # Model pull + benchmark scripts
 ├── requirements.txt
 └── .env.example
 ```
 
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 20+
-- FFmpeg
-- [Ollama](https://ollama.com/) with `moondream2` pulled
-
-### Local Development
-
-```bash
-# 1. Clone and install
-git clone <repo-url> && cd cognistream
-pip install -r requirements.txt
-
-# 2. Pull models (run once, requires internet)
-bash scripts/pull_models.sh
-
-# 3. Start Ollama
-ollama serve &
-ollama pull moondream2
-
-# 4. Start backend
-uvicorn backend.main:app --host 0.0.0.0 --port 8000
-
-# 5. Start frontend
-cd frontend
-npm install
-npm run dev
-```
-
-Open http://localhost:3000
-
-### Docker (Recommended)
-
-```bash
-# Build and start all services
-cd docker
-docker compose up --build
-
-# Or run detached
-docker compose up --build -d
-```
-
-Services start in order: Ollama → ChromaDB → Backend → Frontend.
-
-| Service  | Port  | Resources        |
-|----------|-------|------------------|
-| Frontend | 3000  | 0.5 CPU, 256 MB  |
-| Backend  | 8000  | 2.0 CPU, 3 GB    |
-| Ollama   | 11434 | 2.0 CPU, 3 GB    |
-| ChromaDB | 8500  | 0.5 CPU, 512 MB  |
-
-Total budget: **4 CPU cores, ~6 GB RAM** (edge deployment simulation).
-
-## API Reference
-
-### Ingestion
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/ingest-video` | Upload a video file (streaming, max 2 GB) |
-| `POST` | `/process-video` | Trigger the 10-stage pipeline (async) |
-
-### Search
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/search` | Natural language query over all videos |
-
-Request body:
-```json
-{
-  "query": "red car arriving at the entrance",
-  "video_id": null,
-  "top_k": 10,
-  "source_filter": null
-}
-```
-
-`source_filter` options: `"visual"`, `"audio"`, `"fused"`, `"event"`
-
-### Video Management
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/videos` | List all ingested videos |
-| `GET` | `/video/{id}` | Video metadata + processing status |
-| `GET` | `/video/{id}/stream` | Stream video (supports range requests) |
-| `GET` | `/video/{id}/frame/{name}` | Serve a keyframe image |
-| `GET` | `/video/{id}/benchmark` | Latest stage timings + quality diagnostics |
-| `GET` | `/video/{id}/benchmark/history` | Historical benchmark runs (newest first) |
-| `GET` | `/video/{id}/benchmark/trend` | Trend summary across recent runs |
-| `DELETE` | `/video/{id}` | Delete video and all associated data |
-
-### Health
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Liveness check |
-
-### Benchmark Script
-
-Run local retrieval-quality and pipeline-timing checks against a processed video:
-
-```bash
-python scripts/benchmark_local.py --video-id <VIDEO_ID>
-```
-
-Custom queries (repeat `--query`):
-
-```bash
-python scripts/benchmark_local.py --video-id <VIDEO_ID> --query "person entering room" --query "vehicle movement"
-```
-
-Save a JSON report (and include trend summary):
-
-```bash
-python scripts/benchmark_local.py --video-id <VIDEO_ID> --with-trend --report-json reports/bench_latest.json
-```
-
 ## Configuration
 
-All settings are in `backend/config.py` and overridable via environment variables. See `.env.example` for the full list.
+All settings via environment variables. See `.env.example` for the full list.
 
-Key settings:
+### Key Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OLLAMA_MODEL` | `moondream2` | Vision language model |
-| `WHISPER_MODEL_SIZE` | `base` | Whisper model size |
-| `WHISPER_COMPUTE_TYPE` | `int8` | Quantization for CPU |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence embedding model (384-dim) |
-| `MAX_KEYFRAMES` | `200` | Global keyframe cap per video |
-| `SHOT_THRESHOLD` | `0.45` | Shot boundary sensitivity |
-| `FUSION_WINDOW_SEC` | `2.0` | Temporal window for visual-audio merge |
-| `MAX_VIDEO_SIZE_MB` | `2048` | Upload size limit |
-| `CHROMA_HOST` | `""` | Empty = embedded mode, set for Docker |
-| `LOG_TO_FILE` | `1` | Write a separate per-run debug log file under `data/logs/` |
-| `LOG_FILE_LEVEL` | `DEBUG` | Verbosity for the per-run file log |
+| `OLLAMA_MODEL` | `moondream` | Vision language model (1.8B, fits 6GB VRAM) |
+| `WHISPER_MODEL_SIZE` | `large-v3-turbo` | Whisper model (GPU accelerated) |
+| `WHISPER_DEVICE` | `cuda` | `cuda` or `cpu` |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Text embedding model (384-dim) |
+| `PIPELINE_MODE` | `auto` | `auto`, `quality` (4-pass), `fast` (single-pass) |
+| `VLM_WORKERS` | `0` | 0=auto, 1=sequential, N=concurrent |
+| `NVIDIA_API_KEY` | `""` | Set to enable NVIDIA cloud models |
+| `COGNISTREAM_API_KEY` | `""` | API key auth (comma-separated for multi-user) |
+| `RATE_LIMIT_RPM` | `120` | Requests per minute per IP |
+
+### GPU Memory Management
+
+The pipeline automatically swaps GPU memory between VLM and Whisper when using large models:
+- **Small Whisper** (small, 2GB): VLM + Whisper run in parallel
+- **Large Whisper** (large-v3-turbo, 6GB): VLM runs first → unloads → Whisper gets full VRAM
+
+### NVIDIA Cloud Mode
+
+Set `NVIDIA_API_KEY` in `.env` to enable. No downloads needed — API-based. Falls back to local models on failure. Get a free key at https://build.nvidia.com/
+
+## Performance (RTX 3050 Laptop, 6GB VRAM)
+
+| Stage | Speed |
+|-------|-------|
+| VLM (moondream, 4-pass quality) | ~0.6-0.9s/frame |
+| Whisper (large-v3-turbo, GPU) | 9.7s for 226s audio (7.2x vs CPU) |
+| Full pipeline (156 keyframes) | ~3-5 min |
+| NVIDIA cloud VLM (4 workers) | ~1.7 min for 156 keyframes |
+
+## Tests
+
+```bash
+# Backend (331 tests)
+python -m pytest --tb=short -q
+
+# Frontend (11 tests)
+cd frontend && npx vitest run
+```
 
 ## Tech Stack
 
-**Backend**: Python 3.11, FastAPI, OpenCV, FFmpeg, Faster-Whisper (CTranslate2), SentenceTransformers, ChromaDB, NetworkX, httpx
+**Backend**: Python 3.11, FastAPI, OpenCV, FFmpeg, Ollama, Faster-Whisper (CUDA), SentenceTransformers, SigLIP 2, ChromaDB, NetworkX, spaCy, httpx
 
-**Frontend**: React 19, TypeScript 5.9, Vite 7, Axios
+**Frontend**: React 19, TypeScript, Vite 7, Vitest
 
-**Infrastructure**: Docker Compose, Ollama, nginx
-
-## Data Storage
-
-```
-data/
-├── videos/          # Uploaded video files
-├── frames/          # Extracted JPEG keyframes
-├── audio/           # 16kHz mono WAV files
-├── graphs/          # GraphML knowledge graphs
-└── db/
-    ├── cognistream.db   # SQLite (video metadata, status)
-    └── chroma/          # ChromaDB (vector embeddings)
-```
+**Infrastructure**: Docker Compose, Ollama, nginx, NVIDIA NIM (optional)
 
 ## License
 
