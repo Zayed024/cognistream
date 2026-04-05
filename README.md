@@ -168,6 +168,53 @@ cognistream/
 └── .env.example
 ```
 
+### Phase 0 Baseline Runner
+
+Run repeatable baseline measurements across one or more videos. This will:
+- trigger processing repeatedly
+- capture per-run benchmark payloads
+- compute retrieval diversity per run
+- aggregate elapsed time, estimated VLM frames/min, and process RSS peak
+
+Run with explicit video IDs:
+
+```bash
+python scripts/phase0_baseline.py --video-id <VIDEO_ID> --runs 3
+```
+
+Or auto-discover videos from the API:
+
+```bash
+python scripts/phase0_baseline.py --discover-videos --max-videos 2 --runs 3
+```
+
+Outputs:
+- `reports/phase0/raw/*` per-run JSON payloads
+- `reports/phase0/phase0_summary.json` aggregate machine-readable summary
+- `reports/phase0/phase0_summary.md` quick human-readable summary
+
+### Phase 1 Worker Saturation Benchmark
+
+Compare local VLM throughput at worker counts 1, 2, and 4 on a fixed keyframe subset:
+
+```bash
+python scripts/phase1_worker_saturation.py --video-id <VIDEO_ID> --sample-size 24
+```
+
+Outputs:
+- `reports/phase1/worker_saturation_<VIDEO_ID>.json` with per-worker elapsed time, frames/min, and novelty stats
+
+### Phase 2 Semantic Reuse Benchmark
+
+Run a single end-to-end pass and extract semantic reuse hit metrics:
+
+```bash
+python scripts/phase2_reuse_benchmark.py --video-id <VIDEO_ID>
+```
+
+Outputs:
+- `reports/phase2/<VIDEO_ID>/phase0_summary.json` full run payload
+- `reports/phase2/<VIDEO_ID>/phase2_summary.json` reuse hit ratio and reuse counters
 ## Configuration
 
 All settings via environment variables. See `.env.example` for the full list.

@@ -54,8 +54,8 @@ SHOT_THRESHOLD = float(os.getenv("SHOT_THRESHOLD", "0.45"))
 # Minimum segment length in frames (prevents micro-segments from noise)
 MIN_SEGMENT_FRAMES = int(os.getenv("MIN_SEGMENT_FRAMES", "15"))
 
-# Frame sampling
-MAX_KEYFRAMES_PER_VIDEO = int(os.getenv("MAX_KEYFRAMES", "200"))
+# Frame sampling (Phase 1 conservative reduction defaults)
+MAX_KEYFRAMES_PER_VIDEO = int(os.getenv("MAX_KEYFRAMES", "140"))
 MIN_KEYFRAMES_PER_SEGMENT = 1
 MAX_KEYFRAMES_PER_SEGMENT = int(os.getenv("MAX_KEYFRAMES_PER_SEGMENT", "10"))
 KEYFRAME_IMAGE_FORMAT = "jpg"
@@ -71,6 +71,10 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "moondream")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+# Local best-performing strategy from Phase 2.5 benchmarking on Windows CPU-only:
+# keep backend VLM workers low and raise Ollama request parallelism.
+# Note: OLLAMA_NUM_PARALLEL is consumed by `ollama serve` process, not backend.
+LOCAL_OLLAMA_NUM_PARALLEL_RECOMMENDED = int(os.getenv("LOCAL_OLLAMA_NUM_PARALLEL_RECOMMENDED", "4"))
 
 # ──────────────────────────────────────────────
 # Faster-Whisper (Audio Transcriber)
@@ -147,10 +151,10 @@ PIPELINE_MODE = os.getenv("PIPELINE_MODE", "auto")
 _SMALL_VLMS = {"moondream", "moondream2", "moondream:latest"}
 
 # Number of parallel workers for VLM frame analysis.
-# Local Ollama: keep at 1 (model handles one request at a time).
+# Local Ollama strategy default is 1 worker (np4_w1 profile).
 # NVIDIA cloud: set to 4-8 for concurrent API calls.
-# Auto ("0") = 1 for local, 4 for NVIDIA cloud.
-VLM_WORKERS = int(os.getenv("VLM_WORKERS", "0"))
+# Use explicit default of 1 locally; override with env for experiments.
+VLM_WORKERS = int(os.getenv("VLM_WORKERS", "1"))
 
 # Number of parallel workers for shot detection (splits video into chunks).
 SHOT_DETECTION_WORKERS = int(os.getenv("SHOT_DETECTION_WORKERS", "2"))
@@ -165,11 +169,25 @@ KEYFRAME_NOVELTY_FILTER = os.getenv("KEYFRAME_NOVELTY_FILTER", "1").strip().lowe
     "1", "true", "yes", "on"
 }
 # Mean absolute grayscale difference threshold (0-255) between kept frames.
-KEYFRAME_NOVELTY_DIFF_THRESHOLD = float(os.getenv("KEYFRAME_NOVELTY_DIFF_THRESHOLD", "9.0"))
+KEYFRAME_NOVELTY_DIFF_THRESHOLD = float(os.getenv("KEYFRAME_NOVELTY_DIFF_THRESHOLD", "12.0"))
 # Force-keep a frame after this many consecutive skips to preserve coverage.
-KEYFRAME_NOVELTY_MAX_SKIP = int(os.getenv("KEYFRAME_NOVELTY_MAX_SKIP", "8"))
+KEYFRAME_NOVELTY_MAX_SKIP = int(os.getenv("KEYFRAME_NOVELTY_MAX_SKIP", "10"))
 # Never reduce below this many frames in a video during novelty filtering.
-KEYFRAME_NOVELTY_MIN_KEEP = int(os.getenv("KEYFRAME_NOVELTY_MIN_KEEP", "40"))
+KEYFRAME_NOVELTY_MIN_KEEP = int(os.getenv("KEYFRAME_NOVELTY_MIN_KEEP", "32"))
+
+# Phase 2 semantic reuse cache (conservative, in-run only).
+# Reuses captions for near-identical frames after novelty filtering.
+KEYFRAME_SEMANTIC_REUSE = os.getenv("KEYFRAME_SEMANTIC_REUSE", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+# Signature diff threshold (0-255) for semantic reuse candidates.
+KEYFRAME_SEMANTIC_DIFF_THRESHOLD = float(os.getenv("KEYFRAME_SEMANTIC_DIFF_THRESHOLD", "20.0"))
+# Stricter threshold for exact/near-duplicate reuse tracking.
+KEYFRAME_SEMANTIC_EXACT_THRESHOLD = float(os.getenv("KEYFRAME_SEMANTIC_EXACT_THRESHOLD", "1.5"))
+# Compare only against the most recent representative leaders.
+KEYFRAME_SEMANTIC_LOOKBACK = int(os.getenv("KEYFRAME_SEMANTIC_LOOKBACK", "10"))
+# Maximum frame-index gap allowed for reuse to limit cross-scene leakage.
+KEYFRAME_SEMANTIC_MAX_FRAME_GAP = int(os.getenv("KEYFRAME_SEMANTIC_MAX_FRAME_GAP", "180"))
 
 # Streaming / live-video chunk size in seconds
 STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
@@ -330,6 +348,8 @@ def get_pipeline_tuning_summary() -> dict[str, object]:
     cloud_mode = is_nvidia_enabled()
     return {
         "auto_tune": AUTO_TUNE_PIPELINE,
+        "local_strategy_profile": "np4_w1",
+        "ollama_num_parallel_recommended": LOCAL_OLLAMA_NUM_PARALLEL_RECOMMENDED,
         "platform": hw.platform_name,
         "cpu_cores": hw.cpu_cores,
         "ram_gb": hw.total_ram_gb,

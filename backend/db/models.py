@@ -66,6 +66,9 @@ class VisualCaption:
     objects: list[str] = field(default_factory=list)
     activity: str = ""
     anomaly: Optional[str] = None
+    reused_from_frame: Optional[int] = None
+    reuse_type: Optional[str] = None  # exact | semantic
+    reuse_similarity: Optional[float] = None
 
 
 @dataclass

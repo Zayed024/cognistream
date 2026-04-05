@@ -72,6 +72,8 @@ async def lifespan(app: FastAPI):
     })
     logging.getLogger(__name__).info("Pipeline tuning: %s", {
         "auto_tune": tuning["auto_tune"],
+        "local_strategy_profile": tuning.get("local_strategy_profile"),
+        "ollama_num_parallel_recommended": tuning.get("ollama_num_parallel_recommended"),
         "nvidia_cloud_mode": tuning["nvidia_cloud_mode"],
         "resolved_workers": tuning["resolved_workers"],
         "env_overrides": tuning["env_overrides"],

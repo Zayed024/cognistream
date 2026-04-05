@@ -75,6 +75,7 @@ cogni/
 *.temp
 *.bak
 *.swp
+reports/
 
 # NVIDIA / Secrets
 .nvidia-api-key

@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -42,6 +44,11 @@ from backend.config import (
     KEYFRAME_NOVELTY_FILTER,
     KEYFRAME_NOVELTY_MAX_SKIP,
     KEYFRAME_NOVELTY_MIN_KEEP,
+    KEYFRAME_SEMANTIC_DIFF_THRESHOLD,
+    KEYFRAME_SEMANTIC_EXACT_THRESHOLD,
+    KEYFRAME_SEMANTIC_LOOKBACK,
+    KEYFRAME_SEMANTIC_MAX_FRAME_GAP,
+    KEYFRAME_SEMANTIC_REUSE,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT,
@@ -77,10 +84,19 @@ class OllamaClient:
         model: str | None = None,
         timeout: int | None = None,
     ):
-        self.base_url = (base_url or OLLAMA_BASE_URL).rstrip("/")
+        raw_base = (base_url or OLLAMA_BASE_URL).strip()
+        base_urls = [u.strip().rstrip("/") for u in raw_base.split(",") if u.strip()]
+        if not base_urls:
+            base_urls = ["http://localhost:11434"]
+
+        self.base_urls = base_urls
+        self.base_url = self.base_urls[0]
         self.model = model or OLLAMA_MODEL
         self.timeout = timeout or OLLAMA_TIMEOUT
-        self._generate_url = f"{self.base_url}/api/generate"
+        self._generate_urls = [f"{url}/api/generate" for url in self.base_urls]
+        self._tags_urls = [f"{url}/api/tags" for url in self.base_urls]
+        self._rr_lock = threading.Lock()
+        self._rr_index = 0
 
         # Persistent HTTP client — reuses TCP connections across all
         # generate() calls instead of opening 400 connections per video.
@@ -97,7 +113,7 @@ class OllamaClient:
         """Unload the model from GPU VRAM to free memory for other models."""
         try:
             self._http.post(
-                self._generate_url,
+                self._next_generate_url(),
                 json={"model": self.model, "keep_alive": 0},
             )
             logger.info("Ollama model '%s' unloaded from VRAM.", self.model)
@@ -108,21 +124,30 @@ class OllamaClient:
 
     def is_available(self) -> bool:
         """Return True if Ollama is reachable and the model is loaded."""
-        try:
-            resp = self._http.get(
-                f"{self.base_url}/api/tags",
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                return False
-            models = [m["name"] for m in resp.json().get("models", [])]
-            # Ollama tags may include `:latest` suffix
-            return any(
-                m == self.model or m.startswith(f"{self.model}:")
-                for m in models
-            )
-        except (httpx.HTTPError, KeyError):
-            return False
+        any_ready = False
+        for tags_url in self._tags_urls:
+            try:
+                resp = self._http.get(tags_url, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                models = [m["name"] for m in resp.json().get("models", [])]
+                model_ready = any(
+                    m == self.model or m.startswith(f"{self.model}:")
+                    for m in models
+                )
+                any_ready = any_ready or model_ready
+            except (httpx.HTTPError, KeyError):
+                continue
+
+        return any_ready
+
+    def _next_generate_url(self) -> str:
+        if len(self._generate_urls) == 1:
+            return self._generate_urls[0]
+        with self._rr_lock:
+            url = self._generate_urls[self._rr_index % len(self._generate_urls)]
+            self._rr_index += 1
+            return url
 
     # ── inference ───────────────────────────────────────────────
 
@@ -153,8 +178,9 @@ class OllamaClient:
         }
 
         try:
+            generate_url = self._next_generate_url()
             resp = self._http.post(
-                self._generate_url,
+                generate_url,
                 json=payload,
             )
             resp.raise_for_status()
@@ -222,6 +248,14 @@ class VLMRunner:
         else:
             self.fast_mode = PIPELINE_MODE == "fast"
         self.last_novelty_stats: dict[str, int] = {"input": 0, "kept": 0, "dropped": 0}
+        self.last_reuse_stats: dict[str, int] = {
+            "semantic_reuse_enabled": 1 if KEYFRAME_SEMANTIC_REUSE else 0,
+            "reuse_hits_total": 0,
+            "reuse_hits_exact": 0,
+            "reuse_hits_semantic": 0,
+            "reuse_misses": 0,
+            "reuse_candidates_checked": 0,
+        }
 
     def analyse_keyframes(
         self,
@@ -298,8 +332,14 @@ class VLMRunner:
     ) -> list[VisualCaption]:
         """Process frames one at a time (original behavior)."""
         captions: list[VisualCaption] = []
+        self._reset_reuse_stats()
         for idx, kf in enumerate(keyframes, 1):
-            caption = analyse_fn(kf)
+            reuse = self._try_reuse_caption(kf, captions)
+            if reuse is not None:
+                caption = reuse
+            else:
+                caption = analyse_fn(kf)
+                self.last_reuse_stats["reuse_misses"] += 1
             captions.append(caption)
             if idx % 10 == 0 or idx == total:
                 elapsed = time.monotonic() - t_start
@@ -323,46 +363,140 @@ class VLMRunner:
         Results are returned in the same order as the input keyframes.
         Failed frames get a fallback caption instead of crashing the batch.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
+        self._reset_reuse_stats()
         # Map future → original index to preserve ordering
         captions: list[VisualCaption | None] = [None] * total
         completed = 0
+        submitted = 0
+
+        # In concurrent mode we still reuse from already-finished prior frames.
+        # This keeps behavior deterministic while avoiding cross-thread shared state.
+        known_captions: list[VisualCaption] = []
+
+        def _finalize_future(future_to_idx: dict, future) -> None:
+            nonlocal completed
+            idx = future_to_idx.pop(future)
+            try:
+                captions[idx] = future.result()
+            except Exception as exc:
+                logger.error(
+                    "VLM worker failed on frame %d: %s",
+                    keyframes[idx].frame_number, exc,
+                )
+                # Fallback: empty caption so the pipeline continues
+                captions[idx] = VisualCaption(
+                    keyframe=keyframes[idx],
+                    scene_description="Analysis failed.",
+                    objects=[],
+                    activity="unknown",
+                    anomaly=None,
+                )
+
+            if captions[idx] is not None:
+                known_captions.append(captions[idx])
+
+            completed += 1
+            if completed % 10 == 0 or completed == total:
+                elapsed = time.monotonic() - t_start
+                rate = completed / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "VLM progress: %d/%d keyframes (%.1f frames/min, %d workers)",
+                    completed, total, rate * 60, workers,
+                )
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vlm") as pool:
-            future_to_idx = {
-                pool.submit(analyse_fn, kf): i
-                for i, kf in enumerate(keyframes)
-            }
+            future_to_idx = {}
+            for i, kf in enumerate(keyframes):
+                while len(future_to_idx) >= workers:
+                    done, _ = wait(set(future_to_idx.keys()), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        _finalize_future(future_to_idx, fut)
 
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    captions[idx] = future.result()
-                except Exception as exc:
-                    logger.error(
-                        "VLM worker failed on frame %d: %s",
-                        keyframes[idx].frame_number, exc,
-                    )
-                    # Fallback: empty caption so the pipeline continues
-                    captions[idx] = VisualCaption(
-                        keyframe=keyframes[idx],
-                        scene_description="Analysis failed.",
-                        objects=[],
-                        activity="unknown",
-                        anomaly=None,
-                    )
+                reuse = self._try_reuse_caption(kf, known_captions)
+                if reuse is not None:
+                    captions[i] = reuse
+                    known_captions.append(reuse)
+                    completed += 1
+                    if completed % 10 == 0 or completed == total:
+                        elapsed = time.monotonic() - t_start
+                        rate = completed / elapsed if elapsed > 0 else 0
+                        logger.info(
+                            "VLM progress: %d/%d keyframes (%.1f frames/min, %d workers)",
+                            completed, total, rate * 60, workers,
+                        )
+                    continue
 
-                completed += 1
-                if completed % 10 == 0 or completed == total:
-                    elapsed = time.monotonic() - t_start
-                    rate = completed / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        "VLM progress: %d/%d keyframes (%.1f frames/min, %d workers)",
-                        completed, total, rate * 60, workers,
-                    )
+                self.last_reuse_stats["reuse_misses"] += 1
+                fut = pool.submit(analyse_fn, kf)
+                future_to_idx[fut] = i
+                submitted += 1
+
+            while future_to_idx:
+                done, _ = wait(set(future_to_idx.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    _finalize_future(future_to_idx, fut)
 
         return [c for c in captions if c is not None]
+
+    def _reset_reuse_stats(self) -> None:
+        self.last_reuse_stats = {
+            "semantic_reuse_enabled": 1 if KEYFRAME_SEMANTIC_REUSE else 0,
+            "reuse_hits_total": 0,
+            "reuse_hits_exact": 0,
+            "reuse_hits_semantic": 0,
+            "reuse_misses": 0,
+            "reuse_candidates_checked": 0,
+        }
+
+    def _try_reuse_caption(
+        self,
+        keyframe: Keyframe,
+        prior_captions: list[VisualCaption],
+    ) -> VisualCaption | None:
+        if not KEYFRAME_SEMANTIC_REUSE or not prior_captions:
+            return None
+
+        current_sig = self._frame_signature(keyframe.file_path)
+
+        lookback = max(1, KEYFRAME_SEMANTIC_LOOKBACK)
+        max_gap = max(1, KEYFRAME_SEMANTIC_MAX_FRAME_GAP)
+        exact_th = max(0.0, KEYFRAME_SEMANTIC_EXACT_THRESHOLD)
+        semantic_th = max(exact_th, KEYFRAME_SEMANTIC_DIFF_THRESHOLD)
+
+        best: tuple[VisualCaption, float] | None = None
+        for prev in reversed(prior_captions[-lookback:]):
+            if abs(keyframe.frame_number - prev.keyframe.frame_number) > max_gap:
+                continue
+
+            self.last_reuse_stats["reuse_candidates_checked"] += 1
+            prev_sig = self._frame_signature(prev.keyframe.file_path)
+            diff = self._signature_diff(current_sig, prev_sig)
+
+            if diff <= semantic_th and (best is None or diff < best[1]):
+                best = (prev, diff)
+
+        if best is None:
+            return None
+
+        prev, diff = best
+        reuse_type = "exact" if diff <= exact_th else "semantic"
+
+        reused = replace(
+            prev,
+            keyframe=keyframe,
+            reused_from_frame=prev.keyframe.frame_number,
+            reuse_type=reuse_type,
+            reuse_similarity=round(diff, 3),
+        )
+
+        self.last_reuse_stats["reuse_hits_total"] += 1
+        if reuse_type == "exact":
+            self.last_reuse_stats["reuse_hits_exact"] += 1
+        else:
+            self.last_reuse_stats["reuse_hits_semantic"] += 1
+        return reused
 
     def _prefilter_keyframes_by_novelty(self, keyframes: list[Keyframe]) -> list[Keyframe]:
         """Drop near-duplicate keyframes to reduce VLM calls.

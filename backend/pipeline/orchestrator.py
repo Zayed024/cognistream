@@ -27,7 +27,11 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import logging
+import os
+import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -56,6 +60,46 @@ from backend.visual.vlm_runner import OllamaClient, VLMRunner
 from backend.config import resolve_pipeline_stage_workers
 
 logger = logging.getLogger(__name__)
+
+
+def _get_process_rss_mb() -> float:
+    """Best-effort current process RSS in MiB (works without psutil)."""
+    try:
+        import psutil  # type: ignore
+
+        rss = psutil.Process(os.getpid()).memory_info().rss
+        return round(float(rss) / (1024 * 1024), 2)
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        try:
+            output = subprocess.check_output(
+                ["tasklist", "/fi", f"PID eq {os.getpid()}", "/fo", "csv", "/nh"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if output and """No tasks are running which match the specified criteria.""" not in output:
+                rows = list(csv.reader([output]))
+                if rows:
+                    row = rows[0]
+                    if len(row) >= 5:
+                        mem_field = row[4]
+                        mem_kb_text = re.sub(r"[^0-9]", "", mem_field)
+                        if mem_kb_text:
+                            return round(int(mem_kb_text) / 1024.0, 2)
+        except Exception:
+            pass
+
+    try:
+        import resource
+
+        # Linux reports KiB, macOS reports bytes.
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        scale = 1.0 if os.uname().sysname.lower() == "darwin" else 1024.0  # type: ignore[attr-defined]
+        return round(float(ru.ru_maxrss) * scale / (1024 * 1024), 2)
+    except Exception:
+        return 0.0
 
 
 @dataclass
@@ -134,6 +178,19 @@ class PipelineOrchestrator:
         )
         embedder: Optional[MultimodalEmbedder] = None
         timing_starts: dict[str, float] = {}
+        start_rss_mb = _get_process_rss_mb()
+        peak_rss_mb = start_rss_mb
+        memory_stop = threading.Event()
+
+        def _watch_memory() -> None:
+            nonlocal peak_rss_mb
+            while not memory_stop.wait(0.25):
+                current = _get_process_rss_mb()
+                if current > peak_rss_mb:
+                    peak_rss_mb = current
+
+        memory_thread = threading.Thread(target=_watch_memory, daemon=True)
+        memory_thread.start()
 
         def _start_timer(name: str) -> None:
             timing_starts[name] = time.monotonic()
@@ -384,6 +441,7 @@ class PipelineOrchestrator:
 
             # Quality/efficiency diagnostics for benchmarking.
             novelty = getattr(vlm_runner_ref, "last_novelty_stats", {}) if vlm_runner_ref else {}
+            reuse = getattr(vlm_runner_ref, "last_reuse_stats", {}) if vlm_runner_ref else {}
             captions_with_fallback = sum(
                 1 for c in captions if "no scene description available" in (c.scene_description or "").lower()
             )
@@ -395,6 +453,11 @@ class PipelineOrchestrator:
                 "keyframes_input": float(novelty.get("input", len(keyframes))),
                 "keyframes_kept": float(novelty.get("kept", len(keyframes))),
                 "keyframes_dropped": float(novelty.get("dropped", 0)),
+                "reuse_hits_total": float(reuse.get("reuse_hits_total", 0)),
+                "reuse_hits_exact": float(reuse.get("reuse_hits_exact", 0)),
+                "reuse_hits_semantic": float(reuse.get("reuse_hits_semantic", 0)),
+                "reuse_misses": float(reuse.get("reuse_misses", 0)),
+                "reuse_candidates_checked": float(reuse.get("reuse_candidates_checked", 0)),
                 "captions_count": float(len(captions)),
                 "transcripts_count": float(len(transcripts)),
                 "captions_fallback_ratio": round(captions_with_fallback / total_caps, 4),
@@ -429,6 +492,17 @@ class PipelineOrchestrator:
             self._mark_failed(meta.id, str(exc))
 
         finally:
+            memory_stop.set()
+            memory_thread.join(timeout=1.0)
+            final_rss_mb = _get_process_rss_mb()
+            peak_rss_mb = max(peak_rss_mb, final_rss_mb)
+            result.quality_metrics.setdefault("process_rss_start_mb", round(start_rss_mb, 2))
+            result.quality_metrics.setdefault("process_rss_peak_mb", round(peak_rss_mb, 2))
+            result.quality_metrics.setdefault(
+                "process_rss_delta_mb",
+                round(max(0.0, peak_rss_mb - start_rss_mb), 2),
+            )
+
             # Release models that may still be loaded on exception path
             if embedder is not None:
                 try:
