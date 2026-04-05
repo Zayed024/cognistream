@@ -243,14 +243,33 @@ The pipeline automatically swaps GPU memory between VLM and Whisper when using l
 
 Set `NVIDIA_API_KEY` in `.env` to enable. No downloads needed — API-based. Falls back to local models on failure. Get a free key at https://build.nvidia.com/
 
-## Performance (RTX 3050 Laptop, 6GB VRAM)
+## Performance
 
-| Stage | Speed |
-|-------|-------|
-| VLM (moondream, local GPU) | **0.6–0.9s/frame** |
-| Whisper (large-v3-turbo, GPU) | **9.7s** for 226s audio (7.2x vs CPU) |
-| Full pipeline (156 keyframes) | **~3 min** |
-| With NVIDIA cloud VLM (4 workers) | **~2.5 min** (better quality captions) |
+Benchmarked on RTX 3050 Laptop (6 GB VRAM, 16 GB RAM) with a 3.8-min video (156 keyframes).
+
+### VLM Frame Analysis
+
+| Mode | Per Frame | 156 Keyframes | Caption Quality |
+|------|-----------|---------------|-----------------|
+| **Moondream (GPU)** | **0.6s** | **~1.6 min** | Good — reads text, identifies people/objects |
+| Moondream (CPU) | 17.6s | ~46 min | Same quality, 29x slower |
+| NVIDIA cloud (1 worker) | 3.1s | ~8 min | Excellent — detailed scenes, spatial reasoning |
+| **NVIDIA cloud (4 workers)** | **0.8s effective** | **~2 min** | Excellent (Llama-3.2-11B-Vision) |
+
+### Whisper Speech-to-Text (226s audio)
+
+| Mode | Time | Speedup |
+|------|------|---------|
+| **GPU (large-v3-turbo, float16)** | **9.7s** | **7.2x** |
+| CPU (small, int8) | 70s | baseline |
+
+### Full Pipeline
+
+| Configuration | Total Time |
+|---------------|-----------|
+| **Local GPU (moondream + whisper-turbo)** | **~2 min** |
+| Local CPU only | ~47 min |
+| NVIDIA cloud VLM + local whisper GPU | ~2.5 min |
 
 ## Tests
 
