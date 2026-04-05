@@ -34,14 +34,20 @@ import time
 from pathlib import Path
 
 import httpx
+import cv2
+import numpy as np
 
 from backend.config import (
+    KEYFRAME_NOVELTY_DIFF_THRESHOLD,
+    KEYFRAME_NOVELTY_FILTER,
+    KEYFRAME_NOVELTY_MAX_SKIP,
+    KEYFRAME_NOVELTY_MIN_KEEP,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
     OLLAMA_TIMEOUT,
     PIPELINE_MODE,
-    VLM_WORKERS,
     _SMALL_VLMS,
+    resolve_vlm_workers,
 )
 from backend.db.models import Keyframe, VisualCaption
 from backend.visual.caption_processor import CaptionProcessor, PromptLibrary
@@ -215,6 +221,7 @@ class VLMRunner:
             self.fast_mode = model_name not in _SMALL_VLMS
         else:
             self.fast_mode = PIPELINE_MODE == "fast"
+        self.last_novelty_stats: dict[str, int] = {"input": 0, "kept": 0, "dropped": 0}
 
     def analyse_keyframes(
         self,
@@ -228,6 +235,7 @@ class VLMRunner:
         Returns:
             One :class:`VisualCaption` per keyframe, in the same order.
         """
+        keyframes = self._prefilter_keyframes_by_novelty(keyframes)
         total = len(keyframes)
         if total == 0:
             logger.warning("No keyframes to analyse.")
@@ -263,9 +271,7 @@ class VLMRunner:
         #   0 (auto) = 1 for local Ollama, 4 for NVIDIA cloud
         #   1 = sequential (original behavior, best for local Ollama)
         #   2+ = concurrent (best for NVIDIA cloud or fast local GPU)
-        workers = VLM_WORKERS
-        if workers <= 0:
-            workers = 4 if nvidia.available else 1
+        workers = resolve_vlm_workers(cloud_mode=nvidia.available)
 
         logger.info("VLM mode: %s, workers: %d", mode_label, workers)
 
@@ -358,6 +364,78 @@ class VLMRunner:
 
         return [c for c in captions if c is not None]
 
+    def _prefilter_keyframes_by_novelty(self, keyframes: list[Keyframe]) -> list[Keyframe]:
+        """Drop near-duplicate keyframes to reduce VLM calls.
+
+        Uses low-resolution grayscale frame signatures and keeps frames when
+        visual difference crosses a threshold. A force-keep guard ensures
+        temporal coverage even in static scenes.
+        """
+        self.last_novelty_stats = {
+            "input": len(keyframes),
+            "kept": len(keyframes),
+            "dropped": 0,
+        }
+
+        if not KEYFRAME_NOVELTY_FILTER or len(keyframes) <= 2:
+            return keyframes
+
+        min_keep = min(len(keyframes), max(1, KEYFRAME_NOVELTY_MIN_KEEP))
+        if len(keyframes) <= min_keep:
+            return keyframes
+
+        kept: list[Keyframe] = [keyframes[0]]
+        last_sig = self._frame_signature(keyframes[0].file_path)
+        skipped_in_a_row = 0
+
+        total = len(keyframes)
+        for idx, kf in enumerate(keyframes[1:], start=1):
+            sig = self._frame_signature(kf.file_path)
+            diff = self._signature_diff(last_sig, sig)
+
+            should_keep = diff >= KEYFRAME_NOVELTY_DIFF_THRESHOLD
+            if not should_keep and skipped_in_a_row >= KEYFRAME_NOVELTY_MAX_SKIP:
+                should_keep = True
+
+            remaining = total - (idx + 1)
+            required_remaining = max(0, min_keep - len(kept))
+            if remaining < required_remaining:
+                should_keep = True
+
+            if should_keep:
+                kept.append(kf)
+                last_sig = sig
+                skipped_in_a_row = 0
+            else:
+                skipped_in_a_row += 1
+
+        dropped = len(keyframes) - len(kept)
+        self.last_novelty_stats = {
+            "input": len(keyframes),
+            "kept": len(kept),
+            "dropped": dropped,
+        }
+        if dropped > 0:
+            logger.info(
+                "Keyframe novelty filter: kept %d/%d (dropped %d near-duplicates)",
+                len(kept),
+                len(keyframes),
+                dropped,
+            )
+        return kept
+
+    @staticmethod
+    def _frame_signature(path: str) -> np.ndarray:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return np.zeros((16, 16), dtype=np.float32)
+        small = cv2.resize(img, (16, 16), interpolation=cv2.INTER_AREA)
+        return small.astype(np.float32)
+
+    @staticmethod
+    def _signature_diff(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.mean(np.abs(a - b)))
+
     # ── single-frame analysis ───────────────────────────────────
 
     def _analyse_single_nvidia(self, keyframe: Keyframe) -> VisualCaption:
@@ -368,6 +446,15 @@ class VLMRunner:
             keyframe.file_path,
             PromptLibrary.combined_prompt(),
         ) or ""
+
+        if not combined_raw.strip():
+            # Cloud VLM can fail transiently (DNS/network). Fall back to local
+            # single-pass analysis so we still extract useful visual semantics.
+            logger.warning(
+                "NVIDIA VLM returned empty output for frame %d; falling back to local VLM.",
+                keyframe.frame_number,
+            )
+            return self._analyse_single_fast(keyframe)
 
         caption = self.processor.build_caption_from_combined(
             keyframe=keyframe,

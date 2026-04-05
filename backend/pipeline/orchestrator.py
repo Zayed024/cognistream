@@ -53,6 +53,7 @@ from backend.ingestion.shot_detector import ShotDetector
 from backend.knowledge.event_detector import EventDetector
 from backend.knowledge.graph import KnowledgeGraph
 from backend.visual.vlm_runner import OllamaClient, VLMRunner
+from backend.config import resolve_pipeline_stage_workers
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class PipelineResult:
     elapsed_sec: float = 0.0
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    stage_timings: dict[str, float] = field(default_factory=dict)
+    quality_metrics: dict[str, float] = field(default_factory=dict)
 
 
 # Type alias for progress callback
@@ -130,6 +133,16 @@ class PipelineOrchestrator:
             started_at=t_start,
         )
         embedder: Optional[MultimodalEmbedder] = None
+        timing_starts: dict[str, float] = {}
+
+        def _start_timer(name: str) -> None:
+            timing_starts[name] = time.monotonic()
+
+        def _stop_timer(name: str) -> None:
+            t0 = timing_starts.pop(name, None)
+            if t0 is None:
+                return
+            result.stage_timings[name] = round(time.monotonic() - t0, 3)
 
         try:
             # Mark as processing
@@ -140,24 +153,33 @@ class PipelineOrchestrator:
 
             # Audio extraction is independent of shot detection — run in parallel
             audio_result = None
+            audio_elapsed_sec = 0.0
             def _extract_audio():
                 nonlocal audio_result
+                nonlocal audio_elapsed_sec
+                t0 = time.monotonic()
                 ext = AudioExtractor()
                 audio_result = ext.extract(meta)
+                audio_elapsed_sec = time.monotonic() - t0
 
             audio_thread = threading.Thread(target=_extract_audio, daemon=True)
             audio_thread.start()
 
             # Shot detection + frame sampling (sequential, frame sampling needs shots)
+            _start_timer("shot_detection_sec")
             detector = ShotDetector()
             segments = detector.detect(meta)
+            _stop_timer("shot_detection_sec")
 
             self._emit(progress, 2, "Frame sampling")
+            _start_timer("frame_sampling_sec")
             sampler = FrameSampler()
             keyframes = sampler.sample(meta, segments)
+            _stop_timer("frame_sampling_sec")
 
             # Wait for audio extraction to finish
             audio_thread.join()
+            result.stage_timings["audio_extraction_sec"] = round(audio_elapsed_sec, 3)
             self._emit(progress, 3, "Audio extraction complete")
 
             # ── Stages 4+5: VLM + Whisper ─────────────────────
@@ -171,13 +193,21 @@ class PipelineOrchestrator:
             captions: list[VisualCaption] = []
             transcripts: list[TranscriptSegment] = []
             vlm_client: OllamaClient | None = None
+            vlm_runner_ref: VLMRunner | None = None
 
             def _run_vlm() -> list[VisualCaption]:
-                nonlocal vlm_client
+                nonlocal vlm_client, vlm_runner_ref
                 try:
+                    from backend.providers.nvidia import nvidia
                     vlm_client = OllamaClient()
+                    # NVIDIA cloud VLM does not require local Ollama.
+                    if nvidia.available:
+                        runner = VLMRunner(vlm_client)
+                        vlm_runner_ref = runner
+                        return runner.analyse_keyframes(keyframes)
                     if vlm_client.is_available():
                         runner = VLMRunner(vlm_client)
+                        vlm_runner_ref = runner
                         return runner.analyse_keyframes(keyframes)
                     else:
                         result.warnings.append("Ollama not available — skipping VLM analysis.")
@@ -204,24 +234,34 @@ class PipelineOrchestrator:
                     logger.error("Transcription failed: %s", exc)
                     return []
 
+            stage_workers = resolve_pipeline_stage_workers()
+
             if large_whisper:
                 # Sequential: VLM first → unload from GPU → Whisper gets full VRAM
                 self._emit(progress, 4, "Visual analysis (VLM)")
+                _start_timer("vlm_sec")
                 captions = _run_vlm()
+                _stop_timer("vlm_sec")
                 self._emit(progress, 5, "Unloading VLM for Whisper")
                 if vlm_client:
                     vlm_client.unload()  # Free GPU VRAM
                 self._emit(progress, 5, "Audio transcription (large model)")
+                _start_timer("transcription_sec")
                 transcripts = _run_whisper()
+                _stop_timer("transcription_sec")
             else:
                 # Parallel: both fit in VRAM simultaneously
                 self._emit(progress, 4, "Visual + Audio analysis (parallel)")
-                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline") as pool:
+                _start_timer("vlm_sec")
+                _start_timer("transcription_sec")
+                with ThreadPoolExecutor(max_workers=stage_workers, thread_name_prefix="pipeline") as pool:
                     vlm_future: Future = pool.submit(_run_vlm)
                     whisper_future: Future = pool.submit(_run_whisper)
                     captions = vlm_future.result()
+                    _stop_timer("vlm_sec")
                     self._emit(progress, 5, "Visual analysis complete")
                     transcripts = whisper_future.result()
+                    _stop_timer("transcription_sec")
                     self._emit(progress, 5, "Audio transcription complete")
 
             # ── Stage 6b: Visual frame embeddings (NVCLIP or SigLIP) ─
@@ -281,6 +321,7 @@ class PipelineOrchestrator:
 
             # ── Stage 7: Fusion & embedding ────────────────────
             self._emit(progress, 6, "Multimodal fusion")
+            _start_timer("fusion_embedding_sec")
             fused: list = []
             if not captions and not transcripts:
                 msg = "No captions or transcripts — skipping fusion (video metadata still saved)."
@@ -289,6 +330,7 @@ class PipelineOrchestrator:
             else:
                 embedder = MultimodalEmbedder()
                 fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
+            _stop_timer("fusion_embedding_sec")
 
             # Add NVCLIP image segments (already have embeddings, skip re-embedding)
             if visual_segments:
@@ -296,15 +338,19 @@ class PipelineOrchestrator:
 
             # ── Stage 8: Knowledge graph ───────────────────────
             self._emit(progress, 7, "Knowledge graph")
+            _start_timer("knowledge_graph_sec")
             kg = KnowledgeGraph(meta.id)
             kg.build_from_captions(captions, transcripts)
             kg.save()
+            _stop_timer("knowledge_graph_sec")
 
             # ── Stage 9: Event detection ───────────────────────
             self._emit(progress, 8, "Event detection")
+            _start_timer("event_detection_sec")
             event_detector = EventDetector()
             events = event_detector.detect(kg)
             result.events_detected = len(events)
+            _stop_timer("event_detection_sec")
 
             # Add events as searchable segments
             event_segments = self._events_to_segments(meta.id, events)
@@ -320,6 +366,7 @@ class PipelineOrchestrator:
 
             # ── Stage 10: Store to ChromaDB ────────────────────
             self._emit(progress, 9, "Storing embeddings")
+            _start_timer("store_sec")
             # Purge old data for this video (idempotent reprocessing)
             self.store.purge_video(meta.id)
             if fused:
@@ -327,12 +374,32 @@ class PipelineOrchestrator:
             else:
                 result.segments_stored = 0
                 logger.info("No segments to store — video processed without searchable content.")
+            _stop_timer("store_sec")
 
             # ── Finalise ───────────────────────────────────────
             self._emit(progress, 10, "Complete")
             elapsed = time.monotonic() - t_start
             result.elapsed_sec = round(elapsed, 1)
             result.success = True
+
+            # Quality/efficiency diagnostics for benchmarking.
+            novelty = getattr(vlm_runner_ref, "last_novelty_stats", {}) if vlm_runner_ref else {}
+            captions_with_fallback = sum(
+                1 for c in captions if "no scene description available" in (c.scene_description or "").lower()
+            )
+            static_activity = sum(
+                1 for c in captions if (c.activity or "").strip().lower() == "static scene"
+            )
+            total_caps = max(1, len(captions))
+            result.quality_metrics = {
+                "keyframes_input": float(novelty.get("input", len(keyframes))),
+                "keyframes_kept": float(novelty.get("kept", len(keyframes))),
+                "keyframes_dropped": float(novelty.get("dropped", 0)),
+                "captions_count": float(len(captions)),
+                "transcripts_count": float(len(transcripts)),
+                "captions_fallback_ratio": round(captions_with_fallback / total_caps, 4),
+                "captions_static_ratio": round(static_activity / total_caps, 4),
+            }
 
             self.db.update_status(
                 meta.id,

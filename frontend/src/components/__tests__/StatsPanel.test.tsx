@@ -1,37 +1,29 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import StatsPanel from "../StatsPanel";
+import * as apiClient from "../../api/client";
 
-// Mock axios
-vi.mock("axios", () => {
-  const mockApi = {
-    get: vi.fn(),
-    create: vi.fn(() => mockApi),
-  };
-  return { default: mockApi };
-});
-
-import axios from "axios";
-const mockAxios = axios as unknown as { get: ReturnType<typeof vi.fn> };
+vi.mock("../../api/client", () => ({
+  getStats: vi.fn(),
+}));
 
 describe("StatsPanel", () => {
   const mockStats = {
-    data: {
-      videos: { total: 5, by_status: { PROCESSED: 3, UPLOADED: 2 }, total_duration_human: "12.5m" },
-      segments: { total: 489 },
-      live_feeds: { active: 1, total: 2 },
-      config: {
-        pipeline_mode: "fast",
-        nvidia_cloud: false,
-        vlm_model: "moondream",
-        stt_model: "whisper-small",
-        embedding_model: "bge-small",
-      },
+    videos: { total: 5, by_status: { PROCESSED: 3, UPLOADED: 2 }, total_duration_human: "12.5m" },
+    segments: { total: 489 },
+    live_feeds: { active: 1, total: 2 },
+    config: {
+      pipeline_mode: "fast",
+      nvidia_cloud: false,
+      vlm_model: "moondream",
+      stt_model: "whisper-small",
+      embedding_model: "bge-small",
     },
   };
+  const mockGetStats = vi.mocked(apiClient.getStats);
 
   beforeEach(() => {
-    mockAxios.get.mockResolvedValue(mockStats);
+    mockGetStats.mockResolvedValue(mockStats);
   });
 
   it("renders stat cards after loading", async () => {
@@ -61,7 +53,7 @@ describe("StatsPanel", () => {
   });
 
   it("renders nothing when API fails", () => {
-    mockAxios.get.mockRejectedValue(new Error("fail"));
+    mockGetStats.mockRejectedValue(new Error("fail"));
     const { container } = render(<StatsPanel />);
     expect(container.innerHTML).toBe("");
   });

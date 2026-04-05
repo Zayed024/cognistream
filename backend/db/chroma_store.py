@@ -27,8 +27,12 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
+
+# Keep local logs clean and avoid posthog compatibility warnings.
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 import chromadb
 
@@ -75,10 +79,22 @@ class ChromaStore:
                 self._port,
                 self._collection_name,
             )
-            self._client = chromadb.HttpClient(
-                host=self._host,
-                port=self._port,
-            )
+            try:
+                self._client = chromadb.HttpClient(
+                    host=self._host,
+                    port=self._port,
+                )
+                # Validate connectivity so local dev can fall back cleanly.
+                self._client.heartbeat()
+            except Exception as exc:
+                logger.warning(
+                    "ChromaDB HTTP unavailable at %s:%d (%s). Falling back to embedded storage at %s.",
+                    self._host,
+                    self._port,
+                    exc,
+                    self._persist_dir,
+                )
+                self._client = chromadb.PersistentClient(path=self._persist_dir)
         else:
             logger.info(
                 "Initialising ChromaDB persistent client: dir=%s, collection=%s",

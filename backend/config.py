@@ -6,7 +6,12 @@ with sensible defaults for edge deployment (2-4 CPU cores, 4-6 GB RAM).
 """
 
 import os
+import platform
 from pathlib import Path
+from functools import lru_cache
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
 
 from dotenv import load_dotenv
 
@@ -17,8 +22,13 @@ load_dotenv(_env_path)
 # ──────────────────────────────────────────────
 # Path roots
 # ──────────────────────────────────────────────
-PROJECT_ROOT = Path(os.getenv("COGNISTREAM_ROOT", Path(__file__).resolve().parent.parent))
+_DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Load local .env for non-Docker runs (uvicorn from workspace root).
+load_dotenv(_DEFAULT_PROJECT_ROOT / ".env", override=False)
+
+PROJECT_ROOT = Path(os.getenv("COGNISTREAM_ROOT", _DEFAULT_PROJECT_ROOT))
 DATA_DIR = PROJECT_ROOT / "data"
+LOG_DIR = DATA_DIR / "logs"
 
 VIDEO_DIR = DATA_DIR / "videos"
 FRAME_DIR = DATA_DIR / "frames"
@@ -30,7 +40,7 @@ SQLITE_PATH = DB_DIR / "cognistream.db"
 CHROMA_DIR = DB_DIR / "chroma"
 
 # Ensure all directories exist at import time
-for _d in (VIDEO_DIR, FRAME_DIR, AUDIO_DIR, GRAPH_DIR, DB_DIR, CHROMA_DIR):
+for _d in (VIDEO_DIR, FRAME_DIR, AUDIO_DIR, GRAPH_DIR, DB_DIR, CHROMA_DIR, LOG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 # ──────────────────────────────────────────────
@@ -145,6 +155,22 @@ VLM_WORKERS = int(os.getenv("VLM_WORKERS", "0"))
 # Number of parallel workers for shot detection (splits video into chunks).
 SHOT_DETECTION_WORKERS = int(os.getenv("SHOT_DETECTION_WORKERS", "2"))
 
+# Enable adaptive worker sizing based on detected hardware.
+AUTO_TUNE_PIPELINE = os.getenv("AUTO_TUNE_PIPELINE", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+# Drop near-duplicate keyframes before VLM to reduce local inference cost.
+KEYFRAME_NOVELTY_FILTER = os.getenv("KEYFRAME_NOVELTY_FILTER", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+# Mean absolute grayscale difference threshold (0-255) between kept frames.
+KEYFRAME_NOVELTY_DIFF_THRESHOLD = float(os.getenv("KEYFRAME_NOVELTY_DIFF_THRESHOLD", "9.0"))
+# Force-keep a frame after this many consecutive skips to preserve coverage.
+KEYFRAME_NOVELTY_MAX_SKIP = int(os.getenv("KEYFRAME_NOVELTY_MAX_SKIP", "8"))
+# Never reduce below this many frames in a video during novelty filtering.
+KEYFRAME_NOVELTY_MIN_KEEP = int(os.getenv("KEYFRAME_NOVELTY_MIN_KEEP", "40"))
+
 # Streaming / live-video chunk size in seconds
 STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
 
@@ -173,6 +199,154 @@ def is_nvidia_enabled() -> bool:
     """True if NVIDIA cloud mode is active (API key provided)."""
     return bool(NVIDIA_API_KEY)
 
+
+@dataclass(frozen=True)
+class HardwareProfile:
+    cpu_cores: int
+    total_ram_gb: float
+    has_cuda: bool
+    cuda_vram_gb: float
+    platform_name: str
+
+
+def _detect_total_ram_gb() -> float:
+    """Best-effort RAM detection without hard dependency on psutil."""
+    # Prefer psutil if present.
+    try:
+        import psutil  # type: ignore
+
+        return round(psutil.virtual_memory().total / (1024**3), 2)
+    except Exception:
+        pass
+
+    # Windows fallback via ctypes.
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            mem = MEMORYSTATUSEX()
+            mem.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem))
+            return round(mem.ullTotalPhys / (1024**3), 2)
+        except Exception:
+            pass
+
+    # Conservative fallback when detection fails.
+    return 8.0
+
+
+def _detect_cuda_profile() -> tuple[bool, float]:
+    """Best-effort CUDA + VRAM detection."""
+    try:
+        import torch  # type: ignore
+
+        if not torch.cuda.is_available():
+            return False, 0.0
+
+        total = 0
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            total += int(getattr(props, "total_memory", 0))
+        return True, round(total / (1024**3), 2)
+    except Exception:
+        return False, 0.0
+
+
+@lru_cache(maxsize=1)
+def get_hardware_profile() -> HardwareProfile:
+    """Detect host capabilities once and reuse for worker sizing."""
+    has_cuda, cuda_vram = _detect_cuda_profile()
+    return HardwareProfile(
+        cpu_cores=max(1, os.cpu_count() or 1),
+        total_ram_gb=_detect_total_ram_gb(),
+        has_cuda=has_cuda,
+        cuda_vram_gb=cuda_vram,
+        platform_name=platform.system().lower(),
+    )
+
+
+def resolve_shot_detection_workers() -> int:
+    """Return safe worker count for shot detection on this hardware."""
+    if SHOT_DETECTION_WORKERS > 0 or not AUTO_TUNE_PIPELINE:
+        return max(1, SHOT_DETECTION_WORKERS)
+
+    hw = get_hardware_profile()
+    if hw.total_ram_gb < 6 or hw.cpu_cores <= 2:
+        return 1
+    if hw.total_ram_gb < 12 or hw.cpu_cores <= 4:
+        return 2
+    return min(6, max(2, hw.cpu_cores // 2))
+
+
+def resolve_vlm_workers(cloud_mode: bool) -> int:
+    """Return safe VLM worker count for local/cloud inference."""
+    if VLM_WORKERS > 0 or not AUTO_TUNE_PIPELINE:
+        return max(1, VLM_WORKERS)
+
+    hw = get_hardware_profile()
+
+    # Cloud mode is mostly network-bound and can benefit from moderate fan-out.
+    if cloud_mode:
+        if hw.total_ram_gb < 6:
+            return 1
+        return min(8, max(2, hw.cpu_cores // 2))
+
+    # Local Ollama tends to be single-request bottleneck on CPU systems.
+    if not hw.has_cuda:
+        return 1
+
+    # CUDA local setup can sometimes sustain light concurrency.
+    if hw.cuda_vram_gb >= 12 and hw.total_ram_gb >= 16 and hw.cpu_cores >= 8:
+        return 2
+    return 1
+
+
+def resolve_pipeline_stage_workers() -> int:
+    """Workers for orchestrator's parallel stage executor."""
+    if not AUTO_TUNE_PIPELINE:
+        return 2
+    hw = get_hardware_profile()
+    if hw.total_ram_gb < 6 or hw.cpu_cores <= 2:
+        return 1
+    return 2
+
+
+def get_pipeline_tuning_summary() -> dict[str, object]:
+    """Return detected hardware and resolved worker settings for logging/UI."""
+    hw = get_hardware_profile()
+    cloud_mode = is_nvidia_enabled()
+    return {
+        "auto_tune": AUTO_TUNE_PIPELINE,
+        "platform": hw.platform_name,
+        "cpu_cores": hw.cpu_cores,
+        "ram_gb": hw.total_ram_gb,
+        "cuda": hw.has_cuda,
+        "cuda_vram_gb": hw.cuda_vram_gb,
+        "nvidia_cloud_mode": cloud_mode,
+        "resolved_workers": {
+            "shot_detection": resolve_shot_detection_workers(),
+            "vlm": resolve_vlm_workers(cloud_mode=cloud_mode),
+            "pipeline_stage": resolve_pipeline_stage_workers(),
+        },
+        "env_overrides": {
+            "SHOT_DETECTION_WORKERS": SHOT_DETECTION_WORKERS,
+            "VLM_WORKERS": VLM_WORKERS,
+        },
+    }
+
 # ──────────────────────────────────────────────
 # Security
 # ──────────────────────────────────────────────
@@ -196,3 +370,5 @@ RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 # Logging
 # ──────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_TO_FILE = os.getenv("LOG_TO_FILE", "1").strip().lower() in {"1", "true", "yes", "on"}
+LOG_FILE_LEVEL = os.getenv("LOG_FILE_LEVEL", "DEBUG")

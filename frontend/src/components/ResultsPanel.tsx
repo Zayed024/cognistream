@@ -18,8 +18,6 @@ export default function ResultsPanel({
   error,
   activeIndex,
   onResultClick,
-  onFindSimilar,
-  onExportClip,
 }: ResultsPanelProps) {
   if (isLoading) {
     return (
@@ -63,8 +61,6 @@ export default function ResultsPanel({
             rank={idx + 1}
             isActive={idx === activeIndex}
             onClick={() => onResultClick(idx)}
-            onFindSimilar={onFindSimilar ? () => onFindSimilar(result.segment_id) : undefined}
-            onExportClip={onExportClip ? () => onExportClip(result) : undefined}
           />
         ))}
       </div>
@@ -72,102 +68,64 @@ export default function ResultsPanel({
   );
 }
 
-/* ── Single result card ──────────────────────────────────────── */
+/* Single result card */
 
 function ResultCard({
   result,
   rank,
   isActive,
   onClick,
-  onFindSimilar,
-  onExportClip,
 }: {
   result: SearchResult;
   rank: number;
   isActive: boolean;
   onClick: () => void;
-  onFindSimilar?: () => void;
-  onExportClip?: () => void;
 }) {
   // Split the text into visual caption and speech portions
   const { caption, speech } = splitText(result.text);
 
   return (
-    <div
+    <button
+      onClick={onClick}
       style={{
         ...styles.card,
         borderColor: isActive ? "#3b82f6" : "#e2e8f0",
         background: isActive ? "#eff6ff" : "#fff",
       }}
     >
-      <button onClick={onClick} style={styles.cardContent}>
-        {/* Left: rank + time */}
-        <div style={styles.cardLeft}>
-          <span style={styles.rank}>#{rank}</span>
-          <span style={styles.timestamp}>
-            {formatTime(result.start_time)}
-          </span>
-          <span style={styles.duration}>
-            {formatDuration(result.end_time - result.start_time)}
-          </span>
-        </div>
+      <div style={styles.cardLeft}>
+        <span style={styles.rank}>#{rank}</span>
+        <span style={styles.timestamp}>{formatTime(result.start_time)}</span>
+        <span style={styles.duration}>
+          {formatDuration(result.end_time - result.start_time)}
+        </span>
+      </div>
 
-        {/* Center: text content */}
-        <div style={styles.cardCenter}>
-          {caption && (
-            <p style={styles.captionText}>{caption}</p>
-          )}
-          {speech && (
-            <p style={styles.speechText}>
-              <span style={styles.speechLabel}>Speech: </span>
-              {speech}
-            </p>
-          )}
-          {result.event_type && (
-            <span style={styles.eventBadge}>{result.event_type}</span>
-          )}
-        </div>
+      <div style={styles.cardCenter}>
+        {caption && <p style={styles.captionText}>{caption}</p>}
+        {speech && (
+          <p style={styles.speechText}>
+            <span style={styles.speechLabel}>Speech: </span>
+            {speech}
+          </p>
+        )}
+        {result.event_type && <span style={styles.eventBadge}>{result.event_type}</span>}
+      </div>
 
-        {/* Right: metadata */}
-        <div style={styles.cardRight}>
-          <span style={{
+      <div style={styles.cardRight}>
+        <span
+          style={{
             ...styles.sourceBadge,
             background: sourceBadgeColor(result.source_type),
-          }}>
-            {result.source_type}
-          </span>
-          <span style={styles.score}>
-            {Math.round(result.score * 100)}%
-          </span>
-        </div>
-      </button>
-
-      {/* Action buttons */}
-      {(onFindSimilar || onExportClip) && (
-        <div style={styles.actions}>
-          {onFindSimilar && (
-            <button onClick={onFindSimilar} style={styles.actionBtn} title="Find similar segments">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
-              </svg>
-              Similar
-            </button>
-          )}
-          {onExportClip && (
-            <button onClick={onExportClip} style={styles.actionBtn} title="Export this clip">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-              </svg>
-              Export
-            </button>
-          )}
-        </div>
-      )}
-    </div>
+          }}
+        >
+          {result.source_type}
+        </span>
+        <span style={styles.score}>{Math.round(result.score * 100)}%</span>
+      </div>
+    </button>
   );
 }
-
-/* ── Helpers ─────────────────────────────────────────────────── */
 
 function splitText(text: string): { caption: string; speech: string } {
   const speechMatch = text.match(/\[Speech:\s*(.*?)\]$/s);
@@ -193,14 +151,16 @@ function formatDuration(seconds: number): string {
 
 function sourceBadgeColor(source: string): string {
   switch (source) {
-    case "visual": return "#ede9fe";
-    case "audio":  return "#d1fae5";
-    case "event":  return "#fee2e2";
-    default:       return "#dbeafe"; // fused
+    case "visual":
+      return "#ede9fe";
+    case "audio":
+      return "#d1fae5";
+    case "event":
+      return "#fee2e2";
+    default:
+      return "#dbeafe";
   }
 }
-
-/* ── Styles ──────────────────────────────────────────────────── */
 
 const styles: Record<string, React.CSSProperties> = {
   container: {
@@ -232,22 +192,17 @@ const styles: Record<string, React.CSSProperties> = {
     paddingRight: "4px",
   },
   card: {
-    border: "2px solid #e2e8f0",
-    borderRadius: "10px",
-    transition: "border-color 0.15s, background 0.15s",
-    overflow: "hidden",
-  },
-  cardContent: {
     display: "flex",
     gap: "16px",
     padding: "14px 16px",
+    border: "2px solid #e2e8f0",
+    borderRadius: "10px",
     cursor: "pointer",
     textAlign: "left",
     width: "100%",
+    transition: "border-color 0.15s, background 0.15s",
     fontFamily: "inherit",
     fontSize: "inherit",
-    background: "transparent",
-    border: "none",
   },
   cardLeft: {
     display: "flex",
@@ -332,25 +287,6 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 700,
     fontFamily: "monospace",
     color: "#3b82f6",
-  },
-  actions: {
-    display: "flex",
-    gap: "6px",
-    padding: "6px 16px 10px",
-    borderTop: "1px solid #f1f5f9",
-  },
-  actionBtn: {
-    display: "flex",
-    alignItems: "center",
-    gap: "4px",
-    padding: "4px 10px",
-    fontSize: "11px",
-    fontWeight: 500,
-    background: "#f8fafc",
-    border: "1px solid #e2e8f0",
-    borderRadius: "4px",
-    cursor: "pointer",
-    color: "#475569",
   },
   status: {
     display: "flex",

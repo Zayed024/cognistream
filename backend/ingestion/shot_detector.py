@@ -25,7 +25,7 @@ from typing import Sequence
 import cv2
 import numpy as np
 
-from backend.config import MIN_SEGMENT_FRAMES, SHOT_DETECTION_WORKERS, SHOT_THRESHOLD
+from backend.config import MIN_SEGMENT_FRAMES, SHOT_THRESHOLD, resolve_shot_detection_workers
 from backend.db.models import ShotSegment, VideoMeta
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ class ShotDetector:
         Returns:
             Sorted list of :class:`ShotSegment` covering the entire video.
         """
-        workers = SHOT_DETECTION_WORKERS
+        workers = resolve_shot_detection_workers()
         logger.info(
             "Starting shot detection: %s (%d frames, stride=%d, workers=%d)",
             meta.filename,

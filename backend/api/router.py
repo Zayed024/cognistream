@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 import subprocess
 import threading
@@ -31,7 +32,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
@@ -89,6 +90,23 @@ def cleanup_progress(video_id: str) -> None:
     with _progress_lock:
         _progress_store.pop(video_id, None)
         _progress_events.pop(video_id, None)
+
+
+def _save_benchmark(video_id: str, payload: dict[str, Any]) -> None:
+    run = {
+        "id": uuid.uuid4().hex,
+        "video_id": video_id,
+        "captured_at": payload.get("captured_at") or datetime.now(timezone.utc).isoformat(),
+        "success": bool(payload.get("success", False)),
+        "elapsed_sec": float(payload.get("elapsed_sec", 0.0)),
+        "segments_stored": int(payload.get("segments_stored", 0)),
+        "events_detected": int(payload.get("events_detected", 0)),
+        "stage_timings": payload.get("stage_timings") or {},
+        "quality_metrics": payload.get("quality_metrics") or {},
+        "warnings": payload.get("warnings") or [],
+        "errors": payload.get("errors") or [],
+    }
+    _db.save_benchmark_run(run)
 
 
 # ── Batch processing queue ──
@@ -355,9 +373,39 @@ async def ingest_video(
 def _safe_process(meta):
     """Wrapper that catches and logs exceptions from the background thread."""
     try:
-        _orchestrator.process(meta)
+        result = _orchestrator.process(meta)
+        _save_benchmark(
+            meta.id,
+            {
+                "video_id": meta.id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "success": result.success,
+                "elapsed_sec": result.elapsed_sec,
+                "segments_stored": result.segments_stored,
+                "events_detected": result.events_detected,
+                "stage_timings": result.stage_timings,
+                "quality_metrics": result.quality_metrics,
+                "warnings": result.warnings,
+                "errors": result.errors,
+            },
+        )
     except Exception:
         logger.exception("Background processing failed for video %s", meta.id)
+        _save_benchmark(
+            meta.id,
+            {
+                "video_id": meta.id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "success": False,
+                "elapsed_sec": 0.0,
+                "segments_stored": 0,
+                "events_detected": 0,
+                "stage_timings": {},
+                "quality_metrics": {},
+                "warnings": [],
+                "errors": ["Background processing failed"],
+            },
+        )
     finally:
         cleanup_progress(meta.id)
 
@@ -383,6 +431,21 @@ def _safe_stream_process(meta, chunk_sec: int):
     except Exception:
         logger.exception("Streaming pipeline failed for video %s", meta.id)
         _db.update_status(meta.id, VideoStatus.FAILED, error_message="Streaming pipeline failed")
+        _save_benchmark(
+            meta.id,
+            {
+                "video_id": meta.id,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "success": False,
+                "elapsed_sec": 0.0,
+                "segments_stored": 0,
+                "events_detected": 0,
+                "stage_timings": {},
+                "quality_metrics": {},
+                "warnings": [],
+                "errors": ["Streaming pipeline failed"],
+            },
+        )
     finally:
         cleanup_progress(meta.id)
 
@@ -456,6 +519,102 @@ async def get_progress(video_id: str):
         "total_stages": progress.total_stages,
         "percent": round((progress.stage_number / progress.total_stages) * 100),
         "elapsed_sec": progress.elapsed_sec,
+    }
+
+
+@router.get("/video/{video_id}/benchmark")
+async def get_benchmark(video_id: str):
+    """Get latest benchmark metrics captured for this video processing run."""
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    benchmark = _db.get_latest_benchmark(video_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            404,
+            "No benchmark metrics available yet for this video. Process it first.",
+        )
+
+    return benchmark
+
+
+@router.get("/video/{video_id}/benchmark/history")
+async def get_benchmark_history(video_id: str, limit: int = Query(default=20, ge=1, le=200)):
+    """Get historical benchmark runs (newest first)."""
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    runs = _db.list_benchmark_runs(video_id, limit=limit)
+    return {
+        "video_id": video_id,
+        "count": len(runs),
+        "runs": runs,
+    }
+
+
+@router.get("/video/{video_id}/benchmark/trend")
+async def get_benchmark_trend(video_id: str, limit: int = Query(default=20, ge=2, le=200)):
+    """Summarise benchmark trends across recent runs for regression tracking."""
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    runs = _db.list_benchmark_runs(video_id, limit=limit)
+    if len(runs) < 2:
+        raise HTTPException(404, "Need at least 2 benchmark runs for trend analysis.")
+
+    newest = runs[0]
+    oldest = runs[-1]
+    elapsed_values = [float(r.get("elapsed_sec", 0.0)) for r in runs]
+    elapsed_avg = sum(elapsed_values) / max(1, len(elapsed_values))
+
+    stage_keys: set[str] = set()
+    for run in runs:
+        stage_keys.update((run.get("stage_timings") or {}).keys())
+
+    stage_delta: dict[str, float] = {}
+    for key in sorted(stage_keys):
+        new_v = float((newest.get("stage_timings") or {}).get(key, 0.0))
+        old_v = float((oldest.get("stage_timings") or {}).get(key, 0.0))
+        stage_delta[key] = round(new_v - old_v, 3)
+
+    def _safe_ratio(run: dict, key: str) -> float:
+        val = (run.get("quality_metrics") or {}).get(key, 0.0)
+        try:
+            f = float(val)
+        except Exception:
+            return 0.0
+        return 0.0 if math.isnan(f) else f
+
+    quality_delta = {
+        "captions_fallback_ratio_delta": round(
+            _safe_ratio(newest, "captions_fallback_ratio") - _safe_ratio(oldest, "captions_fallback_ratio"),
+            4,
+        ),
+        "captions_static_ratio_delta": round(
+            _safe_ratio(newest, "captions_static_ratio") - _safe_ratio(oldest, "captions_static_ratio"),
+            4,
+        ),
+        "keyframes_kept_delta": round(
+            _safe_ratio(newest, "keyframes_kept") - _safe_ratio(oldest, "keyframes_kept"),
+            2,
+        ),
+    }
+
+    return {
+        "video_id": video_id,
+        "run_count": len(runs),
+        "elapsed_sec": {
+            "latest": newest.get("elapsed_sec", 0.0),
+            "oldest": oldest.get("elapsed_sec", 0.0),
+            "average": round(elapsed_avg, 3),
+            "delta_latest_minus_oldest": round(float(newest.get("elapsed_sec", 0.0)) - float(oldest.get("elapsed_sec", 0.0)), 3),
+        },
+        "stage_timing_delta": stage_delta,
+        "quality_delta": quality_delta,
     }
 
 
@@ -867,6 +1026,28 @@ async def get_graph(video_id: str):
             "action": data.get("action", ""),
             "timestamp": float(data.get("timestamp", 0)),
         })
+
+    # Older graphs may contain entity nodes without persisted edges.
+    # Synthesize lightweight co-occurrence links from shared timestamps so
+    # the frontend can still show relationships for already-processed videos.
+    if not edges and len(nodes) > 1:
+        grouped_nodes: dict[float, list[str]] = {}
+        for node in nodes:
+            ts = round(float(node.get("first_seen", 0)), 3)
+            grouped_nodes.setdefault(ts, []).append(node["id"])
+
+        for timestamp, node_ids in grouped_nodes.items():
+            unique_ids = list(dict.fromkeys(node_ids))
+            if len(unique_ids) < 2:
+                continue
+            for i, src in enumerate(unique_ids[:-1]):
+                for tgt in unique_ids[i + 1:]:
+                    edges.append({
+                        "source": src,
+                        "target": tgt,
+                        "action": "co_occurs_with",
+                        "timestamp": timestamp,
+                    })
 
     return {"nodes": nodes, "edges": edges}
 

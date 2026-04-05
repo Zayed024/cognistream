@@ -55,7 +55,7 @@ export default function App() {
     (index: number) => {
       setActiveIndex(index);
       const result = results[index];
-      if (result) seekTo(result.start_time);
+      if (result) seekTo(result.start_time, { autoplay: true });
     },
     [results, seekTo]
   );
@@ -269,6 +269,7 @@ export default function App() {
                 onTimeUpdate={onTimeUpdate}
                 onLoadedMetadata={onLoadedMetadata}
                 togglePlay={togglePlay}
+                onSeek={seekTo}
                 activeResult={activeResult}
               />
               <TimelineMarkers
@@ -284,7 +285,7 @@ export default function App() {
                   videoId={selectedVideo.video_id}
                   duration={duration}
                   currentTime={currentTime}
-                  onSeek={seekTo}
+                  onSeek={(time) => seekTo(time, { autoplay: true })}
                 />
               )}
             </div>

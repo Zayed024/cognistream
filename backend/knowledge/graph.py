@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from itertools import combinations
 from typing import Optional
 
 import networkx as nx
@@ -55,7 +56,8 @@ class KnowledgeGraph:
         self._graph_dir = graph_dir or GRAPH_DIR
         self._graph_dir.mkdir(parents=True, exist_ok=True)
         self._graph_path = self._graph_dir / f"{video_id}.graphml"
-        self.G = nx.DiGraph()
+        # Preserve multiple temporal relationships between the same entities.
+        self.G = nx.MultiDiGraph()
 
     # ── build from pipeline outputs ─────────────────────────────
 
@@ -90,11 +92,11 @@ class KnowledgeGraph:
         # to prevent graph bloat — a 10-minute transcript can produce
         # hundreds of keywords, most of which are noise).
         for tseg in transcripts:
-            for kw in tseg.keywords[:3]:
-                normalised = self._normalise(kw)
-                if normalised and len(normalised) > 2:
-                    entity_type = self._classify_entity(normalised)
-                    self.add_entity(normalised, entity_type, tseg.start_time)
+            keywords = self._extract_keywords(tseg.keywords)
+            for kw in keywords:
+                entity_type = self._classify_entity(kw)
+                self.add_entity(kw, entity_type, tseg.start_time)
+            self._extract_keyword_edges(keywords, tseg.start_time)
 
         logger.info(
             "Knowledge graph built: %d nodes, %d edges",
@@ -226,12 +228,12 @@ class KnowledgeGraph:
 
         action = action_verbs[0] if action_verbs else "involved_in"
 
-        # Link pairs of objects, or link first object to activity
+        # Link the primary actor to every other detected entity so the
+        # visual relationships remain visible instead of collapsing to one edge.
         if len(normalised_objects) >= 2:
-            self.add_relationship(
-                normalised_objects[0], normalised_objects[1],
-                action, timestamp,
-            )
+            source = normalised_objects[0]
+            for target in normalised_objects[1:]:
+                self.add_relationship(source, target, action, timestamp)
         else:
             activity_node = self._normalise(activity[:30])
             if activity_node:
@@ -239,3 +241,25 @@ class KnowledgeGraph:
                     normalised_objects[0], activity_node,
                     action, timestamp,
                 )
+
+    def _extract_keywords(self, keywords: list[str]) -> list[str]:
+        """Return up to three unique, normalised keywords."""
+        extracted: list[str] = []
+        seen: set[str] = set()
+
+        for kw in keywords[:3]:
+            normalised = self._normalise(kw)
+            if not normalised or len(normalised) <= 2 or normalised in seen:
+                continue
+            extracted.append(normalised)
+            seen.add(normalised)
+
+        return extracted
+
+    def _extract_keyword_edges(self, keywords: list[str], timestamp: float) -> None:
+        """Connect keywords mentioned together in the same transcript segment."""
+        if len(keywords) < 2:
+            return
+
+        for source, target in combinations(keywords, 2):
+            self.add_relationship(source, target, "mentioned_with", timestamp)

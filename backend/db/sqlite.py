@@ -17,6 +17,7 @@ All timestamps are ISO 8601 strings.  IDs are hex UUIDs.
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -76,9 +77,24 @@ CREATE TABLE IF NOT EXISTS annotations (
     created_at  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    id              TEXT PRIMARY KEY,
+    video_id        TEXT NOT NULL REFERENCES videos(id),
+    captured_at     TEXT NOT NULL,
+    success         INTEGER NOT NULL,
+    elapsed_sec     REAL NOT NULL DEFAULT 0,
+    segments_stored INTEGER NOT NULL DEFAULT 0,
+    events_detected INTEGER NOT NULL DEFAULT 0,
+    stage_timings   TEXT NOT NULL DEFAULT '{}',
+    quality_metrics TEXT NOT NULL DEFAULT '{}',
+    warnings        TEXT NOT NULL DEFAULT '[]',
+    errors          TEXT NOT NULL DEFAULT '[]'
+);
+
 CREATE INDEX IF NOT EXISTS idx_segments_video     ON segments(video_id);
 CREATE INDEX IF NOT EXISTS idx_events_video       ON events(video_id);
 CREATE INDEX IF NOT EXISTS idx_annotations_video  ON annotations(video_id);
+CREATE INDEX IF NOT EXISTS idx_benchmark_video_time ON benchmark_runs(video_id, captured_at DESC);
 """
 
 
@@ -176,10 +192,64 @@ class SQLiteDB:
     def delete_video(self, video_id: str) -> None:
         """Delete a video and all its associated segments and events."""
         with self._connect() as conn:
+            conn.execute("DELETE FROM benchmark_runs WHERE video_id = ?", (video_id,))
             conn.execute("DELETE FROM events WHERE video_id = ?", (video_id,))
             conn.execute("DELETE FROM segments WHERE video_id = ?", (video_id,))
             conn.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         logger.info("Deleted video %s from SQLite.", video_id)
+
+    # ── benchmark runs ─────────────────────────────────────────
+
+    def save_benchmark_run(self, benchmark: dict) -> None:
+        """Persist one benchmark run payload for historical tracking."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO benchmark_runs
+                   (id, video_id, captured_at, success, elapsed_sec,
+                    segments_stored, events_detected, stage_timings,
+                    quality_metrics, warnings, errors)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    benchmark["id"],
+                    benchmark["video_id"],
+                    benchmark["captured_at"],
+                    1 if benchmark.get("success") else 0,
+                    float(benchmark.get("elapsed_sec", 0.0)),
+                    int(benchmark.get("segments_stored", 0)),
+                    int(benchmark.get("events_detected", 0)),
+                    json.dumps(benchmark.get("stage_timings", {}), ensure_ascii=True),
+                    json.dumps(benchmark.get("quality_metrics", {}), ensure_ascii=True),
+                    json.dumps(benchmark.get("warnings", []), ensure_ascii=True),
+                    json.dumps(benchmark.get("errors", []), ensure_ascii=True),
+                ),
+            )
+
+    def get_latest_benchmark(self, video_id: str) -> Optional[dict]:
+        """Get the most recent benchmark run for a video."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM benchmark_runs
+                   WHERE video_id = ?
+                   ORDER BY captured_at DESC
+                   LIMIT 1""",
+                (video_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._benchmark_row_to_dict(row)
+
+    def list_benchmark_runs(self, video_id: str, limit: int = 20) -> list[dict]:
+        """List benchmark runs (newest first) for a video."""
+        safe_limit = max(1, min(200, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM benchmark_runs
+                   WHERE video_id = ?
+                   ORDER BY captured_at DESC
+                   LIMIT ?""",
+                (video_id, safe_limit),
+            ).fetchall()
+        return [self._benchmark_row_to_dict(r) for r in rows]
 
     def segment_count(self, video_id: str) -> int:
         """Count segments for a video."""
@@ -293,3 +363,19 @@ class SQLiteDB:
             processed_at=row["processed_at"],
             error_message=row["error_message"],
         )
+
+    @staticmethod
+    def _benchmark_row_to_dict(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "video_id": row["video_id"],
+            "captured_at": row["captured_at"],
+            "success": bool(row["success"]),
+            "elapsed_sec": row["elapsed_sec"],
+            "segments_stored": row["segments_stored"],
+            "events_detected": row["events_detected"],
+            "stage_timings": json.loads(row["stage_timings"] or "{}"),
+            "quality_metrics": json.loads(row["quality_metrics"] or "{}"),
+            "warnings": json.loads(row["warnings"] or "[]"),
+            "errors": json.loads(row["errors"] or "[]"),
+        }

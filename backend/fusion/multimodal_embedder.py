@@ -249,6 +249,19 @@ class MultimodalEmbedder:
         )
         return vec.tolist()
 
+    def embed_query_local(self, query: str) -> list[float]:
+        """Encode a query with the local SentenceTransformer only.
+
+        Useful when the active Chroma collection stores local embeddings
+        and the cloud provider returns a different vector dimension.
+        """
+        model = self._get_model()
+        vec = model.encode(
+            query,
+            normalize_embeddings=True,
+        )
+        return vec.tolist()
+
     def fuse_and_embed(
         self,
         video_id: str,

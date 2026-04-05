@@ -73,6 +73,7 @@ cognistream/
 │   ├── nginx.conf
 │   └── ollama-entrypoint.sh
 ├── scripts/pull_models.sh      # Pre-download models for offline use
+├── scripts/benchmark_local.py  # Query diversity + stage timing benchmark helper
 ├── requirements.txt
 └── .env.example
 ```
@@ -168,6 +169,9 @@ Request body:
 | `GET` | `/video/{id}` | Video metadata + processing status |
 | `GET` | `/video/{id}/stream` | Stream video (supports range requests) |
 | `GET` | `/video/{id}/frame/{name}` | Serve a keyframe image |
+| `GET` | `/video/{id}/benchmark` | Latest stage timings + quality diagnostics |
+| `GET` | `/video/{id}/benchmark/history` | Historical benchmark runs (newest first) |
+| `GET` | `/video/{id}/benchmark/trend` | Trend summary across recent runs |
 | `DELETE` | `/video/{id}` | Delete video and all associated data |
 
 ### Health
@@ -175,6 +179,26 @@ Request body:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness check |
+
+### Benchmark Script
+
+Run local retrieval-quality and pipeline-timing checks against a processed video:
+
+```bash
+python scripts/benchmark_local.py --video-id <VIDEO_ID>
+```
+
+Custom queries (repeat `--query`):
+
+```bash
+python scripts/benchmark_local.py --video-id <VIDEO_ID> --query "person entering room" --query "vehicle movement"
+```
+
+Save a JSON report (and include trend summary):
+
+```bash
+python scripts/benchmark_local.py --video-id <VIDEO_ID> --with-trend --report-json reports/bench_latest.json
+```
 
 ## Configuration
 
@@ -193,6 +217,8 @@ Key settings:
 | `FUSION_WINDOW_SEC` | `2.0` | Temporal window for visual-audio merge |
 | `MAX_VIDEO_SIZE_MB` | `2048` | Upload size limit |
 | `CHROMA_HOST` | `""` | Empty = embedded mode, set for Docker |
+| `LOG_TO_FILE` | `1` | Write a separate per-run debug log file under `data/logs/` |
+| `LOG_FILE_LEVEL` | `DEBUG` | Verbosity for the per-run file log |
 
 ## Tech Stack
 
