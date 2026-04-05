@@ -105,6 +105,7 @@ class NvidiaProvider:
                 json={
                     "model": NVIDIA_CLIP_MODEL,
                     "input": [f"data:image/jpeg;base64,{b64}"],
+                    "encoding_format": "float",
                 },
             )
             resp.raise_for_status()
@@ -126,7 +127,11 @@ class NvidiaProvider:
             ]
             resp = self._get_client().post(
                 "/embeddings",
-                json={"model": NVIDIA_CLIP_MODEL, "input": inputs},
+                json={
+                    "model": NVIDIA_CLIP_MODEL,
+                    "input": inputs,
+                    "encoding_format": "float",
+                },
             )
             resp.raise_for_status()
             data = resp.json()

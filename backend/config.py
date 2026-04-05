@@ -8,6 +8,12 @@ with sensible defaults for edge deployment (2-4 CPU cores, 4-6 GB RAM).
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env file from project root (if it exists)
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path)
+
 # ──────────────────────────────────────────────
 # Path roots
 # ──────────────────────────────────────────────
@@ -53,21 +59,29 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 # Ollama (Visual Narrative Engine)
 # ──────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "moondream")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e2b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
 # ──────────────────────────────────────────────
 # Faster-Whisper (Audio Transcriber)
 # ──────────────────────────────────────────────
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+# Whisper model: "small" (fast, 2GB GPU), "large-v3-turbo" (best quality, 6GB GPU)
+# When using large-v3-turbo, the VLM is unloaded from GPU first to free VRAM.
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "large-v3-turbo")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 
 # ──────────────────────────────────────────────
 # Embeddings (Multimodal Fusion)
 # ──────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 EMBEDDING_DIM = 384  # local model dimension
+
+# SigLIP visual embedding — embeds frames directly into a text-searchable vector space.
+# Enables visual similarity search without VLM captioning (much faster).
+# Set to empty string to disable.
+SIGLIP_MODEL = os.getenv("SIGLIP_MODEL", "google/siglip2-base-patch16-224")
+SIGLIP_DIM = 768
 
 # When NVIDIA is enabled, embeddings are 1024-dim (NV-EmbedQA-E5-V5).
 # ChromaDB collections are dimension-locked, so we use a separate
@@ -99,6 +113,12 @@ FUSION_WINDOW_SEC = float(os.getenv("FUSION_WINDOW_SEC", "2.0"))
 # ──────────────────────────────────────────────
 DEFAULT_TOP_K = 10
 
+# Multi-vector retrieval weights — how much each modality contributes to
+# the final search score.  Set to 0 to disable a modality.
+RETRIEVAL_WEIGHT_TEXT = float(os.getenv("RETRIEVAL_WEIGHT_TEXT", "0.5"))
+RETRIEVAL_WEIGHT_VISUAL = float(os.getenv("RETRIEVAL_WEIGHT_VISUAL", "0.3"))
+RETRIEVAL_WEIGHT_AUDIO = float(os.getenv("RETRIEVAL_WEIGHT_AUDIO", "0.2"))
+
 # ──────────────────────────────────────────────
 # Pipeline
 # ──────────────────────────────────────────────
@@ -106,9 +126,15 @@ DEFAULT_TOP_K = 10
 # Additional submissions are rejected while processing.
 MAX_CONCURRENT_JOBS = 1
 
-# Processing mode: "fast" = single-pass VLM + parallel stages (3-4x faster)
-#                  "quality" = 4-pass VLM + sequential (original behavior)
-PIPELINE_MODE = os.getenv("PIPELINE_MODE", "fast")
+# Processing mode: "auto" (default) = picks best strategy per model
+#   moondream → 4-pass quality (small model, needs focused prompts)
+#   gemma3n/gemma4/qwen → single-pass fast (larger model, handles structured output)
+#   nvidia cloud → single-pass fast
+# Can also be forced to "quality" (always 4-pass) or "fast" (always single-pass).
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "auto")
+
+# Known small models that need 4-pass quality mode (can't follow combined prompts)
+_SMALL_VLMS = {"moondream", "moondream2", "moondream:latest"}
 
 # Number of parallel workers for VLM frame analysis.
 # Local Ollama: keep at 1 (model handles one request at a time).
@@ -139,7 +165,7 @@ NVIDIA_VLM_MODEL = os.getenv("NVIDIA_VLM_MODEL", "meta/llama-3.2-11b-vision-inst
 NVIDIA_EMBED_MODEL = os.getenv("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
 NVIDIA_ASR_MODEL = os.getenv("NVIDIA_ASR_MODEL", "nvidia/parakeet-ctc-1_1b-asr")
 NVIDIA_ASR_FUNCTION_ID = os.getenv("NVIDIA_ASR_FUNCTION_ID", "1598d209-5e27-4d3c-8079-4751568b1081")
-NVIDIA_CLIP_MODEL = os.getenv("NVIDIA_CLIP_MODEL", "nvidia/nvclip-vit-h-14")
+NVIDIA_CLIP_MODEL = os.getenv("NVIDIA_CLIP_MODEL", "nvidia/nvclip")
 NVIDIA_GROUNDING_MODEL = os.getenv("NVIDIA_GROUNDING_MODEL", "nvidia/nv-grounding-dino")
 NVIDIA_GROUNDING_URL = os.getenv("NVIDIA_GROUNDING_URL", "https://ai.api.nvidia.com/v1/cv/nvidia/nv-grounding-dino")
 

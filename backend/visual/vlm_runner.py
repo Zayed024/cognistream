@@ -41,6 +41,7 @@ from backend.config import (
     OLLAMA_TIMEOUT,
     PIPELINE_MODE,
     VLM_WORKERS,
+    _SMALL_VLMS,
 )
 from backend.db.models import Keyframe, VisualCaption
 from backend.visual.caption_processor import CaptionProcessor, PromptLibrary
@@ -85,6 +86,17 @@ class OllamaClient:
     def close(self) -> None:
         """Close the persistent HTTP client."""
         self._http.close()
+
+    def unload(self) -> None:
+        """Unload the model from GPU VRAM to free memory for other models."""
+        try:
+            self._http.post(
+                self._generate_url,
+                json={"model": self.model, "keep_alive": 0},
+            )
+            logger.info("Ollama model '%s' unloaded from VRAM.", self.model)
+        except Exception as exc:
+            logger.debug("Ollama unload failed: %s", exc)
 
     # ── health ──────────────────────────────────────────────────
 
@@ -195,7 +207,14 @@ class VLMRunner:
         self.client = client or OllamaClient()
         self.processor = processor or CaptionProcessor()
         self.max_retries = max_retries
-        self.fast_mode = fast_mode if fast_mode is not None else (PIPELINE_MODE == "fast")
+        # Auto-detect mode based on model name
+        if fast_mode is not None:
+            self.fast_mode = fast_mode
+        elif PIPELINE_MODE == "auto":
+            model_name = (self.client.model or "").lower().split(":")[0]
+            self.fast_mode = model_name not in _SMALL_VLMS
+        else:
+            self.fast_mode = PIPELINE_MODE == "fast"
 
     def analyse_keyframes(
         self,

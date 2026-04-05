@@ -173,7 +173,8 @@ class TestIntegrationPipeline:
         # Use SentenceTransformer for real embeddings
         embedded = embedder.embed(fused)
         assert all(s.embedding is not None for s in embedded)
-        assert len(embedded[0].embedding) == 384  # MiniLM-L6-v2 dimension
+        # Dimension depends on provider: 384 (local MiniLM) or 1024 (NVIDIA NV-Embed)
+        assert len(embedded[0].embedding) in (384, 1024)
 
         # Store in ChromaDB
         store = ChromaStore(

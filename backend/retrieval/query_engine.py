@@ -33,7 +33,12 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
-from backend.config import DEFAULT_TOP_K
+from backend.config import (
+    DEFAULT_TOP_K,
+    RETRIEVAL_WEIGHT_AUDIO,
+    RETRIEVAL_WEIGHT_TEXT,
+    RETRIEVAL_WEIGHT_VISUAL,
+)
 from backend.db.chroma_store import ChromaStore
 from backend.db.models import SearchResult
 from backend.fusion.multimodal_embedder import MultimodalEmbedder
@@ -105,7 +110,7 @@ class QueryEngine:
             logger.warning("Empty query — returning no results.")
             return []
 
-        # Stage 1: embed the query
+        # Stage 1: embed the query (text embedding)
         logger.info("Search query: '%s'", query)
         query_embedding = self.embedder.embed_query(query)
 
@@ -117,6 +122,17 @@ class QueryEngine:
             video_id=video_id,
             source_filter=source_filter,
         )
+
+        # Stage 2b: visual embedding search (SigLIP/NVCLIP)
+        # Search with the visual embedding of the query text to find
+        # matching frames that were embedded with SigLIP/NVCLIP.
+        if RETRIEVAL_WEIGHT_VISUAL > 0:
+            visual_results = self._visual_search(query, fetch_k, video_id)
+            if visual_results:
+                raw_results = self._merge_multi_vector(
+                    raw_results, visual_results,
+                    RETRIEVAL_WEIGHT_TEXT, RETRIEVAL_WEIGHT_VISUAL,
+                )
 
         if not raw_results:
             logger.info("No results found for query: '%s'", query)
@@ -135,6 +151,81 @@ class QueryEngine:
             len(results),
             results[0].score if results else 0.0,
         )
+        return results
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Stage 2b: Multi-vector visual search
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _visual_search(
+        self, query: str, top_k: int, video_id: Optional[str]
+    ) -> list[dict]:
+        """Search using visual embeddings (SigLIP or NVCLIP).
+
+        Embeds the query text in the visual vector space and searches
+        for matching frame embeddings stored as source_type="visual".
+        """
+        visual_embedding = None
+
+        # Try NVIDIA NVCLIP first
+        from backend.providers.nvidia import nvidia
+        if nvidia.available:
+            visual_embedding = nvidia.embed_text(query)
+
+        # Fall back to local SigLIP
+        if visual_embedding is None:
+            try:
+                from backend.visual.siglip_embedder import SigLIPEmbedder
+                siglip = SigLIPEmbedder()
+                if siglip.enabled:
+                    visual_embedding = siglip.embed_text(query)
+                    siglip.unload()
+            except Exception:
+                pass
+
+        if visual_embedding is None:
+            return []
+
+        return self.store.query(
+            embedding=visual_embedding,
+            top_k=top_k,
+            video_id=video_id,
+            source_filter="visual",
+        )
+
+    @staticmethod
+    def _merge_multi_vector(
+        text_results: list[dict],
+        visual_results: list[dict],
+        text_weight: float,
+        visual_weight: float,
+    ) -> list[dict]:
+        """Merge results from text and visual searches.
+
+        Segments found in both get a combined score.  Segments found in
+        only one modality keep their weighted score.
+        """
+        total_weight = text_weight + visual_weight
+        if total_weight <= 0:
+            return text_results
+
+        tw = text_weight / total_weight
+        vw = visual_weight / total_weight
+
+        merged: dict[str, dict] = {}
+
+        for r in text_results:
+            rid = r["id"]
+            merged[rid] = {**r, "score": r["score"] * tw}
+
+        for r in visual_results:
+            rid = r["id"]
+            if rid in merged:
+                merged[rid]["score"] += r["score"] * vw
+            else:
+                merged[rid] = {**r, "score": r["score"] * vw}
+
+        results = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
         return results
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -160,16 +160,24 @@ class PipelineOrchestrator:
             audio_thread.join()
             self._emit(progress, 3, "Audio extraction complete")
 
-            # ── Stages 4+5: VLM + Whisper (PARALLEL) ──────────
-            self._emit(progress, 4, "Visual + Audio analysis (parallel)")
+            # ── Stages 4+5: VLM + Whisper ─────────────────────
+            # GPU memory strategy:
+            #   - If whisper uses "small" model (~2GB), run VLM + Whisper in PARALLEL
+            #   - If whisper uses "large-v3-turbo" (~6GB), run SEQUENTIALLY with GPU swap
+            #     (unload VLM → run Whisper → reload VLM is not needed since VLM runs first)
+            from backend.config import WHISPER_MODEL_SIZE
+            large_whisper = WHISPER_MODEL_SIZE in ("large-v3", "large-v3-turbo", "distil-large-v3", "large")
+
             captions: list[VisualCaption] = []
             transcripts: list[TranscriptSegment] = []
+            vlm_client: OllamaClient | None = None
 
             def _run_vlm() -> list[VisualCaption]:
+                nonlocal vlm_client
                 try:
-                    client = OllamaClient()
-                    if client.is_available():
-                        runner = VLMRunner(client)
+                    vlm_client = OllamaClient()
+                    if vlm_client.is_available():
+                        runner = VLMRunner(vlm_client)
                         return runner.analyse_keyframes(keyframes)
                     else:
                         result.warnings.append("Ollama not available — skipping VLM analysis.")
@@ -196,26 +204,54 @@ class PipelineOrchestrator:
                     logger.error("Transcription failed: %s", exc)
                     return []
 
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline") as pool:
-                vlm_future: Future = pool.submit(_run_vlm)
-                whisper_future: Future = pool.submit(_run_whisper)
+            if large_whisper:
+                # Sequential: VLM first → unload from GPU → Whisper gets full VRAM
+                self._emit(progress, 4, "Visual analysis (VLM)")
+                captions = _run_vlm()
+                self._emit(progress, 5, "Unloading VLM for Whisper")
+                if vlm_client:
+                    vlm_client.unload()  # Free GPU VRAM
+                self._emit(progress, 5, "Audio transcription (large model)")
+                transcripts = _run_whisper()
+            else:
+                # Parallel: both fit in VRAM simultaneously
+                self._emit(progress, 4, "Visual + Audio analysis (parallel)")
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline") as pool:
+                    vlm_future: Future = pool.submit(_run_vlm)
+                    whisper_future: Future = pool.submit(_run_whisper)
+                    captions = vlm_future.result()
+                    self._emit(progress, 5, "Visual analysis complete")
+                    transcripts = whisper_future.result()
+                    self._emit(progress, 5, "Audio transcription complete")
 
-                captions = vlm_future.result()
-                self._emit(progress, 5, "Visual analysis complete")
-                transcripts = whisper_future.result()
-                self._emit(progress, 5, "Audio transcription complete")
-
-            # ── Stage 6b: NVCLIP image embeddings (when NVIDIA available) ─
+            # ── Stage 6b: Visual frame embeddings (NVCLIP or SigLIP) ─
             from backend.providers.nvidia import nvidia
-            nvclip_segments: list[FusedSegment] = []
-            if nvidia.available and keyframes:
-                self._emit(progress, 5, "NVCLIP image embeddings")
-                import uuid as _uuid
+            import uuid as _uuid
+            visual_segments: list[FusedSegment] = []
+
+            if keyframes:
                 image_paths = [kf.file_path for kf in keyframes]
-                clip_vectors = nvidia.embed_images(image_paths)
+                clip_vectors = None
+
+                if nvidia.available:
+                    self._emit(progress, 5, "NVCLIP image embeddings")
+                    clip_vectors = nvidia.embed_images(image_paths)
+                    if clip_vectors:
+                        logger.info("NVCLIP: %d image embeddings", len(clip_vectors))
+                else:
+                    # Local SigLIP fallback
+                    from backend.visual.siglip_embedder import SigLIPEmbedder
+                    siglip = SigLIPEmbedder()
+                    if siglip.enabled:
+                        self._emit(progress, 5, "SigLIP image embeddings")
+                        clip_vectors = siglip.embed_images(image_paths)
+                        if clip_vectors:
+                            logger.info("SigLIP: %d image embeddings", len(clip_vectors))
+                        siglip.unload()
+
                 if clip_vectors:
                     for kf, vec in zip(keyframes, clip_vectors):
-                        nvclip_segments.append(FusedSegment(
+                        visual_segments.append(FusedSegment(
                             id=_uuid.uuid4().hex,
                             video_id=meta.id,
                             start_time=kf.timestamp,
@@ -225,7 +261,6 @@ class PipelineOrchestrator:
                             frame_path=kf.file_path,
                             embedding=vec,
                         ))
-                    logger.info("NVCLIP: %d image embeddings created", len(nvclip_segments))
 
             # ── Stage 6c: Grounding DINO object detection (when NVIDIA available) ─
             if nvidia.available and keyframes:
@@ -256,8 +291,8 @@ class PipelineOrchestrator:
                 fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
 
             # Add NVCLIP image segments (already have embeddings, skip re-embedding)
-            if nvclip_segments:
-                fused.extend(nvclip_segments)
+            if visual_segments:
+                fused.extend(visual_segments)
 
             # ── Stage 8: Knowledge graph ───────────────────────
             self._emit(progress, 7, "Knowledge graph")

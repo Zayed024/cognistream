@@ -39,10 +39,24 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import time
 from collections import Counter
 from pathlib import Path
+
+# ── CUDA DLL fix for Windows ──────────────────────────────────
+# pip-installed nvidia-cublas-cu12 places DLLs in site-packages,
+# which Python/CTranslate2 can't find without this.
+_CUDA_PACKAGES = ["nvidia.cublas", "nvidia.cuda_nvrtc", "nvidia.cudnn"]
+for _pkg_name in _CUDA_PACKAGES:
+    try:
+        _pkg = __import__(_pkg_name, fromlist=[""])
+        _bin = Path(_pkg.__path__[0]) / "bin"
+        if _bin.is_dir():
+            os.add_dll_directory(str(_bin))
+    except (ImportError, AttributeError, OSError):
+        pass
 
 from backend.config import (
     WHISPER_COMPUTE_TYPE,
