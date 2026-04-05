@@ -200,18 +200,18 @@ Set `NVIDIA_API_KEY` in `.env` to enable. No downloads needed — API-based. Fal
 
 | Stage | Speed |
 |-------|-------|
-| VLM (moondream, 4-pass quality) | ~0.6-0.9s/frame |
-| Whisper (large-v3-turbo, GPU) | 9.7s for 226s audio (7.2x vs CPU) |
-| Full pipeline (156 keyframes) | ~3-5 min |
-| NVIDIA cloud VLM (4 workers) | ~1.7 min for 156 keyframes |
+| VLM (moondream, local GPU) | **0.6–0.9s/frame** |
+| Whisper (large-v3-turbo, GPU) | **9.7s** for 226s audio (7.2x vs CPU) |
+| Full pipeline (156 keyframes) | **~3 min** |
+| With NVIDIA cloud VLM (4 workers) | **~2.5 min** (better quality captions) |
 
 ## Tests
 
 ```bash
-# Backend (331 tests)
+# Backend (342 tests)
 python -m pytest --tb=short -q
 
-# Frontend (11 tests)
+# Frontend (16 tests)
 cd frontend && npx vitest run
 ```
 
