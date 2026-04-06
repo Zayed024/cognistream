@@ -23,14 +23,17 @@ data/frames/
 data/graphs/
 data/db/
 
-# Model files / weights
+# Model files / weights (large binaries)
 *.bin
 *.pt
 *.pth
 *.onnx
-*.safetensors
 *.gguf
-models/
+
+# Allow our fine-tuned embedder in the repo (88 MB, safetensors)
+# This lets it work on any device without re-training
+!models/cognistream-embedder/
+!models/cognistream-embedder/**
 
 # IDE / Editor
 .idea/
@@ -91,3 +94,11 @@ branch2/
 
 # Claude Code settings
 .claude/
+
+# Fine-tuning data, checkpoints, and model weights
+data/finetune/
+checkpoints/
+*.gguf
+
+# Test videos (downloaded by scripts/download_test_videos.py)
+data/test_videos/

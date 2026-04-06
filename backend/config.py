@@ -88,7 +88,11 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
 # ──────────────────────────────────────────────
 # Embeddings (Multimodal Fusion)
 # ──────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+# Fine-tuned embedder (trained on CogniStream video captions).
+# Falls back to all-MiniLM-L6-v2 if the fine-tuned model doesn't exist.
+_FINETUNED_EMBEDDER = str(Path(__file__).resolve().parent.parent / "models" / "cognistream-embedder")
+_DEFAULT_EMBEDDER = _FINETUNED_EMBEDDER if Path(_FINETUNED_EMBEDDER).is_dir() else "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", _DEFAULT_EMBEDDER)
 EMBEDDING_DIM = 384  # local model dimension
 
 # SigLIP visual embedding — embeds frames directly into a text-searchable vector space.

@@ -38,7 +38,7 @@ Search uses a 4-stage retrieval pipeline: embed query → multi-vector search (t
 |-----------|----------------|------------------------|
 | **VLM** | moondream (1.8B, GPU) | Llama-3.2-11B-Vision |
 | **STT** | Whisper large-v3-turbo (GPU) | Parakeet ASR |
-| **Text Embeddings** | all-MiniLM-L6-v2 (384-dim) | NV-EmbedQA-E5 (1024-dim) |
+| **Text Embeddings** | cognistream-embedder (fine-tuned, 384-dim) | NV-EmbedQA-E5 (1024-dim) |
 | **Visual Embeddings** | SigLIP 2 (768-dim) | NVCLIP (1024-dim) |
 | **Object Detection** | — | NV-Grounding-DINO |
 
@@ -263,13 +263,38 @@ Benchmarked on RTX 3050 Laptop (6 GB VRAM, 16 GB RAM) with a 3.8-min video (156 
 | **GPU (large-v3-turbo, float16)** | **9.7s** | **7.2x** |
 | CPU (small, int8) | 70s | baseline |
 
-### Full Pipeline
+### Full Pipeline (8 standard test videos)
 
-| Configuration | Total Time |
-|---------------|-----------|
-| **Local GPU (moondream + whisper-turbo)** | **~2 min** |
-| Local CPU only | ~47 min |
-| NVIDIA cloud VLM + local whisper GPU | ~2.5 min |
+| Configuration | Total Time | Videos |
+|---------------|-----------|--------|
+| **Fine-tuned embedder + NVIDIA VLM** | **157.6s** | 8/8, 80 segments, 0% empty |
+| Baseline (all-MiniLM-L6-v2 + NVIDIA VLM) | 411.0s | 8/8, 80 segments, 0% empty |
+
+## Fine-tuned Models
+
+### cognistream-embedder (included in repo)
+
+A fine-tuned `all-MiniLM-L6-v2` (384-dim) trained on 1,181 query-passage pairs generated from NVIDIA Llama-3.2-11B-Vision captions via knowledge distillation. Improves retrieval precision for video-specific queries.
+
+- **Location**: `models/cognistream-embedder/` (88 MB, included in repo)
+- **Auto-detected**: `config.py` uses it if the directory exists, falls back to `all-MiniLM-L6-v2`
+- **Training**: 3 epochs, MultipleNegativesRankingLoss, 11 min on CPU
+- **Training data**: 315 NVIDIA-distilled captions → 1,181 synthetic query-passage pairs
+
+### Knowledge Distillation Pipeline
+
+Re-train or improve the models with your own data:
+
+```bash
+# Step 1: Generate training data from NVIDIA cloud VLM (needs API key)
+python scripts/finetune/distill.py
+
+# Step 2: Fine-tune embeddings (11 min on CPU, no GPU needed)
+python scripts/finetune/train_embeddings.py
+
+# Step 3: (Future) Fine-tune VLM via moondream's training repo
+# python scripts/finetune/train.py
+```
 
 ## Tests
 
@@ -279,6 +304,9 @@ python -m pytest --tb=short -q
 
 # Frontend (16 tests)
 cd frontend && npx vitest run
+
+# Benchmark on standard test videos
+python scripts/benchmark_test_videos.py --tag my_run
 ```
 
 ## Tech Stack
@@ -288,6 +316,8 @@ cd frontend && npx vitest run
 **Frontend**: React 19, TypeScript, Vite 7, Vitest
 
 **Infrastructure**: Docker Compose, Ollama, nginx, NVIDIA NIM (optional)
+
+**Fine-tuning**: PyTorch, PEFT/LoRA, sentence-transformers, knowledge distillation
 
 ## License
 
