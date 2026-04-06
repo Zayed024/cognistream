@@ -1,19 +1,21 @@
 """
-CogniStream — QLoRA Fine-tuning Script for Moondream2
+CogniStream — Moondream2 Fine-tuning Script
 
-Fine-tunes moondream2 using its native training API with LoRA adapters.
-Uses the distilled dataset from NVIDIA cloud VLM.
+Fine-tunes moondream2's text model on NVIDIA-distilled captions.
+Vision encoder is frozen (official recommendation).
+
+Uses moondream's internal text encoding + LM head for proper loss
+computation with the model's custom architecture.
 
 Prerequisites:
-    pip install peft bitsandbytes accelerate pillow
+    pip install transformers torch pillow einops
 
 Usage:
     python scripts/finetune/train.py
-    python scripts/finetune/train.py --epochs 5 --lr 1e-4 --rank 32
+    python scripts/finetune/train.py --epochs 3 --lr 3e-5
 
 Output:
-    data/finetune/cognistream-moondream-lora/
-    data/finetune/cognistream-moondream-merged/
+    data/finetune/cognistream-moondream/
 """
 
 from __future__ import annotations
@@ -21,11 +23,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -42,16 +46,15 @@ logger = logging.getLogger(__name__)
 
 FINETUNE_DIR = DATA_DIR / "finetune"
 DATASET_PATH = FINETUNE_DIR / "distillation_dataset.jsonl"
-LORA_OUTPUT = FINETUNE_DIR / "cognistream-moondream-lora"
-MERGED_OUTPUT = FINETUNE_DIR / "cognistream-moondream-merged"
+OUTPUT_DIR = FINETUNE_DIR / "cognistream-moondream"
 
 BASE_MODEL = "vikhyatk/moondream2"
+MD_REVISION = "2024-08-26"
 
 
-def load_dataset():
-    """Load the distillation dataset."""
+def load_dataset() -> list[dict]:
     if not DATASET_PATH.exists():
-        logger.error("Dataset not found: %s\nRun distillation first.", DATASET_PATH)
+        logger.error("Dataset not found: %s", DATASET_PATH)
         sys.exit(1)
 
     items = []
@@ -61,105 +64,138 @@ def load_dataset():
             if Path(item["image_path"]).exists():
                 items.append(item)
 
+    random.shuffle(items)
     logger.info("Loaded %d training examples", len(items))
     return items
 
 
 def train(args):
-    """Run LoRA fine-tuning using moondream's native API."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import LoraConfig, get_peft_model, TaskType
 
     items = load_dataset()
-    if not items:
-        logger.error("No valid training examples found.")
-        sys.exit(1)
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
 
-    logger.info("Loading base model: %s", BASE_MODEL)
+    logger.info("Device: %s | Model: %s (rev=%s)", DEVICE, BASE_MODEL, args.revision)
 
-    # Load model — use float16, no 4-bit for now (moondream is small enough)
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL, revision=args.revision, trust_remote_code=True,
+    )
     model = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True,
+        BASE_MODEL, revision=args.revision, trust_remote_code=True,
+        dtype=DTYPE, device_map={"": DEVICE},
     )
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
-    # Find all linear layer names
-    target_modules = set()
-    for name, module in model.named_modules():
-        if "Linear" in type(module).__name__:
-            short = name.split(".")[-1]
-            target_modules.add(short)
-    target_modules.discard("lm_head")
+    # Freeze vision encoder
+    vision_frozen = 0
+    text_trainable = 0
+    for name, param in model.named_parameters():
+        if "vision" in name.lower() or "visual" in name.lower() or "enc" in name.lower():
+            param.requires_grad = False
+            vision_frozen += param.numel()
+        else:
+            param.requires_grad = True
+            text_trainable += param.numel()
 
-    logger.info("LoRA targets: %s", sorted(target_modules))
-    logger.info("Config: rank=%d, alpha=%d, lr=%s, epochs=%d",
-                args.rank, args.alpha, args.lr, args.epochs)
+    logger.info("Frozen: %dM params | Trainable: %dM params",
+                vision_frozen // 1_000_000, text_trainable // 1_000_000)
 
-    # Apply LoRA
-    lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.alpha,
-        target_modules=list(target_modules),
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, lora_config)
-
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    logger.info("Trainable: %d / %d (%.2f%%)", trainable, total, 100 * trainable / total)
-
-    # Custom training loop using moondream's native encoding
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=float(args.lr),
-        weight_decay=0.01,
+        lr=float(args.lr), weight_decay=0.01,
     )
 
+    # Get the internal text model and embedding layer
+    inner = model.model if hasattr(model, 'model') else model
+    wte = inner.text.wte if hasattr(inner, 'text') else None
+
+    if wte is None:
+        logger.error("Cannot find text embedding layer (model.model.text.wte)")
+        sys.exit(1)
+
+    # Get tokenizer from the inner model (moondream uses its own tokenizer)
+    md_tokenizer = inner.tokenizer if hasattr(inner, 'tokenizer') else None
+
     model.train()
-    total_steps = len(items) * args.epochs // args.grad_accum
+    total_steps = (len(items) * args.epochs) // args.grad_accum
     step = 0
     t_start = time.monotonic()
 
     for epoch in range(args.epochs):
+        random.shuffle(items)
         epoch_loss = 0.0
         batch_loss = 0.0
+        valid = 0
 
         for i, item in enumerate(items):
             try:
-                # Load image and encode text
-                image = Image.open(item["image_path"]).convert("RGB")
+                # Tokenize the answer text
+                answer = item["response"]
 
-                # Build the training text: prompt + response
-                text = f"{item['prompt']}\n{item['response']}"
+                if md_tokenizer:
+                    token_ids = md_tokenizer.encode(answer).ids
+                else:
+                    token_ids = tokenizer.encode(answer, add_special_tokens=False)
 
-                # Tokenize
-                tokens = tokenizer(
-                    text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512,
-                ).to(model.device)
+                if len(token_ids) < 5:
+                    continue
 
-                # Forward pass — use the base model's text generation head
-                outputs = model.base_model.model.text_model(
-                    inputs_embeds=model.base_model.model.text_model.get_input_embeddings()(tokens["input_ids"]),
-                    attention_mask=tokens["attention_mask"],
-                )
+                # Truncate to max length
+                token_ids = token_ids[:512]
+                input_ids = torch.tensor([token_ids], device=DEVICE)
 
-                # Compute language modeling loss
-                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = tokens["input_ids"][..., 1:].contiguous()
+                # Get embeddings
+                embeds = F.embedding(input_ids, wte)
 
-                loss_fn = torch.nn.CrossEntropyLoss()
-                loss = loss_fn(
+                # Forward through text model blocks
+                hidden = embeds
+                text_model = inner.text
+
+                # Simple forward: embedding → transformer blocks → layer norm
+                for block in text_model.blocks:
+                    # Layer norm
+                    ln_weight = block.ln.weight
+                    ln_bias = block.ln.bias if hasattr(block.ln, 'bias') else None
+                    normed = F.layer_norm(hidden, (hidden.size(-1),), ln_weight, ln_bias)
+
+                    # Self-attention (simplified — no KV cache for training)
+                    qkv = block.attn.qkv(normed)
+                    d = hidden.size(-1)
+                    q, k, v = qkv.split([d, d // 4 * 2, d // 4 * 2], dim=-1) if qkv.size(-1) != d * 3 else qkv.chunk(3, dim=-1)
+
+                    # Scaled dot-product attention
+                    bsz, seq_len = hidden.shape[:2]
+                    n_heads = d // 64  # head_dim = 64
+                    head_dim = 64
+
+                    # Reshape for multi-head attention
+                    q_heads = q[..., :d].view(bsz, seq_len, n_heads, head_dim).transpose(1, 2)
+                    k_heads = k.view(bsz, seq_len, -1, head_dim).transpose(1, 2)
+                    v_heads = v.view(bsz, seq_len, -1, head_dim).transpose(1, 2)
+
+                    # Causal mask
+                    causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=DEVICE), diagonal=1).bool()
+                    attn_out = F.scaled_dot_product_attention(
+                        q_heads, k_heads, v_heads, attn_mask=~causal_mask.unsqueeze(0).unsqueeze(0)
+                    )
+                    attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, d)
+                    attn_out = block.attn.proj(attn_out)
+
+                    # MLP
+                    mlp_out = block.mlp.fc2(F.gelu(block.mlp.fc1(normed)))
+
+                    hidden = hidden + attn_out + mlp_out
+
+                # LM head
+                hidden = F.layer_norm(hidden, (hidden.size(-1),),
+                                      text_model.post_ln.weight,
+                                      text_model.post_ln.bias if hasattr(text_model.post_ln, 'bias') else None)
+                logits = text_model.lm_head(hidden)
+
+                # Cross-entropy loss (next token prediction)
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+                loss = F.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1),
                 )
@@ -167,9 +203,12 @@ def train(args):
                 loss = loss / args.grad_accum
                 loss.backward()
                 batch_loss += loss.item()
+                valid += 1
 
-                if (i + 1) % args.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if valid % args.grad_accum == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in model.parameters() if p.requires_grad], 1.0
+                    )
                     optimizer.step()
                     optimizer.zero_grad()
                     step += 1
@@ -177,49 +216,37 @@ def train(args):
                     if step % 5 == 0:
                         elapsed = time.monotonic() - t_start
                         logger.info(
-                            "Epoch %d | Step %d/%d | Loss: %.4f | %.1f min elapsed",
+                            "Epoch %d | Step %d/%d | Loss: %.4f | %.1f min",
                             epoch + 1, step, total_steps, batch_loss, elapsed / 60,
                         )
                     epoch_loss += batch_loss
                     batch_loss = 0.0
 
             except Exception as exc:
-                logger.debug("Skipping sample %d: %s", i, exc)
+                if i < 5:
+                    logger.warning("Sample %d: %s", i, str(exc)[:100])
                 continue
 
-        logger.info("Epoch %d complete | Avg loss: %.4f", epoch + 1,
-                    epoch_loss / max(1, len(items) // args.grad_accum))
+        n_steps = max(1, valid // args.grad_accum)
+        logger.info("Epoch %d | Avg loss: %.4f | Valid: %d/%d",
+                    epoch + 1, epoch_loss / n_steps, valid, len(items))
 
     elapsed = time.monotonic() - t_start
-    logger.info("Training complete in %.1f min", elapsed / 60)
+    logger.info("Training complete: %d steps in %.1f min", step, elapsed / 60)
 
-    # Save LoRA adapter
-    LORA_OUTPUT.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(LORA_OUTPUT))
-    tokenizer.save_pretrained(str(LORA_OUTPUT))
-    logger.info("LoRA adapter saved: %s", LORA_OUTPUT)
-
-    # Merge
-    if args.merge:
-        logger.info("Merging LoRA into base model...")
-        merged = model.merge_and_unload()
-        MERGED_OUTPUT.mkdir(parents=True, exist_ok=True)
-        merged.save_pretrained(str(MERGED_OUTPUT))
-        tokenizer.save_pretrained(str(MERGED_OUTPUT))
-        logger.info("Merged model saved: %s", MERGED_OUTPUT)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(OUTPUT_DIR))
+    tokenizer.save_pretrained(str(OUTPUT_DIR))
+    logger.info("Saved: %s", OUTPUT_DIR)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=8)
-    parser.add_argument("--lr", default="2e-4")
-    parser.add_argument("--rank", type=int, default=16)
-    parser.add_argument("--alpha", type=int, default=32)
-    parser.add_argument("--merge", action="store_true", default=True)
-    parser.add_argument("--no-merge", dest="merge", action="store_false")
+    parser.add_argument("--lr", default="3e-5")
+    parser.add_argument("--revision", default=MD_REVISION)
     args = parser.parse_args()
-
     train(args)
 
 
