@@ -28,6 +28,7 @@ services:
     environment:
       - OLLAMA_MODEL=moondream2
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4
     ports:
       - "11434:11434"
     deploy:
@@ -87,6 +88,7 @@ services:
       - COGNISTREAM_ROOT=/app
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=moondream2
+      - VLM_WORKERS=1
       - OLLAMA_TIMEOUT=120
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
