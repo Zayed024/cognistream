@@ -40,7 +40,7 @@ Search uses a 4-stage retrieval pipeline: embed query → multi-vector search (t
 | **STT** | Whisper large-v3-turbo (GPU) | Parakeet ASR |
 | **Text Embeddings** | cognistream-embedder (fine-tuned, 384-dim) | NV-EmbedQA-E5 (1024-dim) |
 | **Visual Embeddings** | SigLIP 2 (768-dim) | NVCLIP (1024-dim) |
-| **Object Detection** | — | NV-Grounding-DINO |
+| **CV Pre-filter** | YOLOv8n via `ultralytics` (optional, ~6 MB) | NV-Grounding-DINO |
 
 The pipeline auto-detects model capabilities and adjusts (4-pass prompts for small VLMs, single-pass for larger ones).
 
@@ -151,7 +151,7 @@ cognistream/
 │   ├── providers/nvidia.py     # NVIDIA NIM cloud (NVCLIP, NV-Embed, VLM, ASR)
 │   ├── webhooks.py             # Event notifications
 │   ├── db/                     # SQLite + ChromaDB wrappers
-│   └── tests/                  # 331 tests (21 test files)
+│   └── tests/                  # 342 tests (21 test files)
 ├── frontend/
 │   └── src/
 │       ├── components/         # 10 components + 3 test files
@@ -168,53 +168,6 @@ cognistream/
 └── .env.example
 ```
 
-### Phase 0 Baseline Runner
-
-Run repeatable baseline measurements across one or more videos. This will:
-- trigger processing repeatedly
-- capture per-run benchmark payloads
-- compute retrieval diversity per run
-- aggregate elapsed time, estimated VLM frames/min, and process RSS peak
-
-Run with explicit video IDs:
-
-```bash
-python scripts/phase0_baseline.py --video-id <VIDEO_ID> --runs 3
-```
-
-Or auto-discover videos from the API:
-
-```bash
-python scripts/phase0_baseline.py --discover-videos --max-videos 2 --runs 3
-```
-
-Outputs:
-- `reports/phase0/raw/*` per-run JSON payloads
-- `reports/phase0/phase0_summary.json` aggregate machine-readable summary
-- `reports/phase0/phase0_summary.md` quick human-readable summary
-
-### Phase 1 Worker Saturation Benchmark
-
-Compare local VLM throughput at worker counts 1, 2, and 4 on a fixed keyframe subset:
-
-```bash
-python scripts/phase1_worker_saturation.py --video-id <VIDEO_ID> --sample-size 24
-```
-
-Outputs:
-- `reports/phase1/worker_saturation_<VIDEO_ID>.json` with per-worker elapsed time, frames/min, and novelty stats
-
-### Phase 2 Semantic Reuse Benchmark
-
-Run a single end-to-end pass and extract semantic reuse hit metrics:
-
-```bash
-python scripts/phase2_reuse_benchmark.py --video-id <VIDEO_ID>
-```
-
-Outputs:
-- `reports/phase2/<VIDEO_ID>/phase0_summary.json` full run payload
-- `reports/phase2/<VIDEO_ID>/phase2_summary.json` reuse hit ratio and reuse counters
 ## Configuration
 
 All settings via environment variables. See `.env.example` for the full list.
@@ -245,7 +198,28 @@ Set `NVIDIA_API_KEY` in `.env` to enable. No downloads needed — API-based. Fal
 
 ## Performance
 
-Benchmarked on RTX 3050 Laptop (6 GB VRAM, 16 GB RAM) with a 3.8-min video (156 keyframes).
+Benchmarked on RTX 3050 Laptop (6 GB VRAM, 16 GB RAM).
+
+### Full Pipeline (7 standard test videos, NVIDIA cloud VLM)
+
+| Configuration | Total Time | Per video avg | Notes |
+|---|---:|---:|---|
+| **+ local YOLO CV pre-filter** | **109.7s** | **15.7s** | 7/7 success, 117 segments, 0% empty |
+| Apr 6 baseline (no CV filter) | 157.6s | 19.7s | 8/8 success, 80 segments, 0% empty |
+| All-MiniLM baseline (no fine-tuning) | 411.0s | 51.4s | 8/8 success, 80 segments, 0% empty |
+
+The CV pre-filter (YOLOv8n via `ultralytics`, ~6 MB local model) drops keyframes with no interesting objects before they reach the slow VLM. Cuts average `vlm_sec` per video from 15.91s → **8.59s (-46%)**. Frame drop rate varies by content:
+
+| Video | Keyframes kept | Dropped |
+|---|---:|---:|
+| `outdoor_nature.mp4` | 11 / 46 | **76%** |
+| `lecture_clip.mp4` | 2 / 10 | **80%** |
+| `xiph_foreman.mp4` | 7 / 10 | 30% |
+| `cooking_demo.mp4` | 9 / 10 | 10% |
+| `xiph_bus.mp4` | 8 / 10 | 20% |
+| `traffic_cam.mp4`, `xiph_news.mp4` | 10 / 10 | 0% |
+
+Install with `pip install ultralytics` (uncomment in `requirements.txt`). Without it the pipeline still runs — VLM just sees every keyframe.
 
 ### VLM Frame Analysis
 
@@ -262,13 +236,6 @@ Benchmarked on RTX 3050 Laptop (6 GB VRAM, 16 GB RAM) with a 3.8-min video (156 
 |------|------|---------|
 | **GPU (large-v3-turbo, float16)** | **9.7s** | **7.2x** |
 | CPU (small, int8) | 70s | baseline |
-
-### Full Pipeline (8 standard test videos)
-
-| Configuration | Total Time | Videos |
-|---------------|-----------|--------|
-| **Fine-tuned embedder + NVIDIA VLM** | **157.6s** | 8/8, 80 segments, 0% empty |
-| Baseline (all-MiniLM-L6-v2 + NVIDIA VLM) | 411.0s | 8/8, 80 segments, 0% empty |
 
 ## Fine-tuned Models
 
