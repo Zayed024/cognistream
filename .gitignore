@@ -22,6 +22,8 @@ data/audio/
 data/frames/
 data/graphs/
 data/db/
+data/alerts/
+data/logs/
 
 # Model files / weights (large binaries)
 *.bin
@@ -30,10 +32,13 @@ data/db/
 *.onnx
 *.gguf
 
-# Allow our fine-tuned embedder in the repo (88 MB, safetensors)
-# This lets it work on any device without re-training
+# Allow our fine-tuned models in the repo so they work on any device
+# cognistream-embedder: 88 MB (all-MiniLM-L6-v2 fine-tuned on video queries)
+# cognistream-moondream-lora: 52 MB (moondream LoRA adapter from Colab training)
 !models/cognistream-embedder/
 !models/cognistream-embedder/**
+!models/cognistream-moondream-lora/
+!models/cognistream-moondream-lora/**
 
 # IDE / Editor
 .idea/

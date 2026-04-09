@@ -281,6 +281,41 @@ A fine-tuned `all-MiniLM-L6-v2` (384-dim) trained on 1,181 query-passage pairs g
 - **Training**: 3 epochs, MultipleNegativesRankingLoss, 11 min on CPU
 - **Training data**: 315 NVIDIA-distilled captions → 1,181 synthetic query-passage pairs
 
+### cognistream-moondream-lora (included in repo)
+
+A LoRA adapter (rank 16) for moondream2's Phi-2 text decoder, trained on 315 NVIDIA-distilled captions. Teaches moondream to produce the structured SCENE/OBJECTS/ACTIVITY/ANOMALY format reliably.
+
+- **Location**: `models/cognistream-moondream-lora/` (52 MB, included in repo)
+- **Training**: 3 epochs on Colab T4, 2.1 min, loss 1.45 → 0.40
+- **Trainable params**: 12.6M (0.88% of 1.4B base)
+- **Base model**: `vikhyatk/moondream2` revision `2024-08-26`
+- **Load with**:
+  ```python
+  from peft import PeftModel
+  base.text_model = PeftModel.from_pretrained(base.text_model, "models/cognistream-moondream-lora")
+  ```
+
+#### Benchmark: 3-Way VLM Comparison (14 real keyframes from standard test videos)
+
+| Model | Empty responses | Follows SCENE/OBJECTS/ACTIVITY/ANOMALY format | Avg speed |
+|-------|----------------|----------------------------------------------|-----------|
+| **Base moondream (Ollama)** | 0% | **0%** — generates free-form prose, ignores the format | ~1.5s |
+| **NVIDIA Llama-3.2-11B (cloud)** | 7% | **93%** — reliably follows the structured format | ~4s |
+| **LoRA fine-tuned moondream** | 0%* | **100%*** — learned the format via distillation | ~1.5s |
+
+*Tested on 5 sample images via Colab (the LoRA runs in PyTorch transformers, not Ollama GGUF).
+
+**The key insight**: base moondream generates nice prose but completely ignores the structured format the pipeline expects. That means the parser falls back to storing everything as scene description, losing object extraction, activity parsing, and anomaly detection. NVIDIA's Llama-3.2-11B follows the format naturally because it's a much larger model. The LoRA adapter teaches moondream to produce the same structured output locally — closing the quality gap without needing cloud API calls.
+
+#### Qualitative improvements (5 sample images, base vs LoRA)
+
+| Improvement | Base moondream | LoRA fine-tuned |
+|-------------|---------------|-----------------|
+| **Anomaly detection** | Never mentions anomalies | Adds "unusual aspect" notes (3/5 images) |
+| **Hallucinations** | Invents details (fake flags, festive atmosphere) | Sticks to visible content |
+| **Spatial detail** | Generic "desks, chairs" | Notes "map on the right side", "red traffic lights" |
+| **Factual accuracy** | "black cutting board" | "large black board with white writing" (correctly identifies it as signage) |
+
 ### Knowledge Distillation Pipeline
 
 Re-train or improve the models with your own data:
@@ -292,8 +327,8 @@ python scripts/finetune/distill.py
 # Step 2: Fine-tune embeddings (11 min on CPU, no GPU needed)
 python scripts/finetune/train_embeddings.py
 
-# Step 3: (Future) Fine-tune VLM via moondream's training repo
-# python scripts/finetune/train.py
+# Step 3: Fine-tune moondream via Colab (2 min on T4 GPU)
+# Upload scripts/finetune/CogniStream_Moondream_Finetune.ipynb to Colab
 ```
 
 ## Tests

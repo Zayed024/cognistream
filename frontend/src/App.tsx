@@ -9,12 +9,13 @@ import KnowledgeGraph from "./components/KnowledgeGraph";
 import EventTimeline from "./components/EventTimeline";
 import LiveView from "./components/LiveView";
 import StatsPanel from "./components/StatsPanel";
+import AlertsPanel from "./components/AlertsPanel";
 import { useSearch } from "./hooks/useSearch";
 import { useVideo } from "./hooks/useVideo";
 import { getVideoStreamUrl, processVideo, findSimilar, exportClip } from "./api/client";
 import type { VideoMeta, SearchResult } from "./types";
 
-type View = "list" | "search" | "global-search" | "live";
+type View = "list" | "search" | "global-search" | "live" | "alerts";
 
 export default function App() {
   // Navigation state
@@ -103,6 +104,13 @@ export default function App() {
     setView("live");
   }, [clear]);
 
+  const handleOpenAlerts = useCallback(() => {
+    setSelectedVideo(null);
+    setActiveIndex(null);
+    clear();
+    setView("alerts");
+  }, [clear]);
+
   // Find similar handler
   const handleFindSimilar = useCallback(async (segmentId: string) => {
     try {
@@ -162,7 +170,7 @@ export default function App() {
   );
 
   const isSearchView = view === "search" || view === "global-search";
-  const showBackBtn = isSearchView || view === "live";
+  const showBackBtn = isSearchView || view === "live" || view === "alerts";
 
   return (
     <div style={styles.app}>
@@ -188,16 +196,23 @@ export default function App() {
                 ? "Search All Videos"
                 : view === "live"
                 ? "Live Video Feeds"
+                : view === "alerts"
+                ? "Alert Rules & Templates"
                 : "Multimodal Video Retrieval"}
             </p>
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           {view === "list" && (
-            <button onClick={handleOpenLive} style={styles.liveBtn}>
-              <span style={styles.liveDot} />
-              Live
-            </button>
+            <>
+              <button onClick={handleOpenAlerts} style={styles.alertsBtn}>
+                Alerts
+              </button>
+              <button onClick={handleOpenLive} style={styles.liveBtn}>
+                <span style={styles.liveDot} />
+                Live
+              </button>
+            </>
           )}
           {view === "search" && selectedVideo?.status === "PROCESSED" && (
             <button
@@ -213,6 +228,8 @@ export default function App() {
       {/* Main content */}
       {view === "live" ? (
         <LiveView onBack={handleBackToList} />
+      ) : view === "alerts" ? (
+        <AlertsPanel onBack={handleBackToList} />
       ) : view === "list" ? (
         <>
         <StatsPanel />
@@ -411,6 +428,17 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: "13px",
     fontWeight: 600,
     color: "#dc2626",
+    cursor: "pointer",
+    marginTop: "4px",
+  },
+  alertsBtn: {
+    padding: "8px 14px",
+    background: "#fffbeb",
+    border: "1px solid #fde68a",
+    borderRadius: "8px",
+    fontSize: "13px",
+    fontWeight: 600,
+    color: "#d97706",
     cursor: "pointer",
     marginTop: "4px",
   },

@@ -51,6 +51,7 @@ from backend.config import (
     FFMPEG_PATH,
     FRAME_DIR,
     KEYFRAME_JPEG_QUALITY,
+    STREAM_CHUNK_OVERLAP_SEC,
     STREAM_CHUNK_SEC,
 )
 from backend.db.chroma_store import ChromaStore
@@ -136,12 +137,16 @@ class StreamingPipeline:
         db: SQLiteDB | None = None,
         store: ChromaStore | None = None,
         chunk_sec: int | None = None,
+        chunk_overlap_sec: int | None = None,
         on_chunk: ChunkCallback | None = None,
         on_live_event: LiveEventCallback | None = None,
     ):
         self.db = db or SQLiteDB()
         self.store = store or ChromaStore()
         self.chunk_sec = chunk_sec or STREAM_CHUNK_SEC
+        self.chunk_overlap_sec = (
+            chunk_overlap_sec if chunk_overlap_sec is not None else STREAM_CHUNK_OVERLAP_SEC
+        )
         self._on_chunk = on_chunk
         self._on_live_event = on_live_event
         self._stop_event = threading.Event()
@@ -163,10 +168,14 @@ class StreamingPipeline:
             logger.error("Cannot determine video duration: %s", meta.file_path)
             return
 
-        total_chunks = max(1, math.ceil(duration / self.chunk_sec))
+        # Stride is chunk_sec minus overlap — so chunks slide forward by stride
+        # but each chunk is chunk_sec wide. Borrowed from VSS 3.
+        stride = max(1, self.chunk_sec - self.chunk_overlap_sec)
+        total_chunks = max(1, math.ceil((duration - self.chunk_overlap_sec) / stride))
         logger.info(
-            "Streaming pipeline: %s → %d chunks of %ds (duration=%.1fs)",
-            meta.filename, total_chunks, self.chunk_sec, duration,
+            "Streaming pipeline: %s → %d chunks of %ds (overlap=%ds, stride=%ds, duration=%.1fs)",
+            meta.filename, total_chunks, self.chunk_sec,
+            self.chunk_overlap_sec, stride, duration,
         )
 
         fps = meta.fps or 30.0
@@ -185,8 +194,8 @@ class StreamingPipeline:
                 break
 
             t_chunk_start = time.monotonic()
-            chunk_start_sec = chunk_idx * self.chunk_sec
-            chunk_end_sec = min((chunk_idx + 1) * self.chunk_sec, duration)
+            chunk_start_sec = chunk_idx * stride
+            chunk_end_sec = min(chunk_start_sec + self.chunk_sec, duration)
             start_frame = int(chunk_start_sec * fps)
             end_frame = int(chunk_end_sec * fps)
 
@@ -221,6 +230,32 @@ class StreamingPipeline:
                 segments_stored = self.store.add_segments(fused)
             else:
                 segments_stored = 0
+
+            # Evaluate alert rules on each new segment
+            from backend.alerts import alert_engine
+            for seg in fused:
+                seg_dict = {
+                    "id": seg.id,
+                    "text": seg.text,
+                    "start_time": seg.start_time,
+                    "end_time": seg.end_time,
+                    "source_type": seg.source_type,
+                }
+                fired_alerts = alert_engine.evaluate_segment(meta.id, seg_dict)
+                # Push alerts via live event callback for WebSocket clients
+                if fired_alerts and self._on_live_event:
+                    for alert in fired_alerts:
+                        self._on_live_event(LiveEvent(
+                            video_id=meta.id,
+                            event_type="alert_triggered",
+                            data={
+                                "rule_name": alert.rule_name,
+                                "severity": alert.severity,
+                                "matched": alert.matched_text,
+                                "at_sec": alert.triggered_at_sec,
+                            },
+                            timestamp=alert.timestamp,
+                        ))
 
             elapsed = time.monotonic() - t_chunk_start
             progress = ChunkProgress(
@@ -644,6 +679,24 @@ class _LiveFeedWorker(threading.Thread):
                     if fused:
                         embedder.embed(fused)
                         segments_stored = self.store.add_segments(fused)
+
+                    # Evaluate alert rules — fires webhooks + WebSocket events
+                    from backend.alerts import alert_engine
+                    for seg in fused:
+                        seg_dict = {
+                            "id": seg.id,
+                            "text": seg.text,
+                            "start_time": seg.start_time,
+                            "end_time": seg.end_time,
+                            "source_type": seg.source_type,
+                        }
+                        for alert in alert_engine.evaluate_segment(self.video_id, seg_dict):
+                            self._emit_event("alert_triggered", {
+                                "rule_name": alert.rule_name,
+                                "severity": alert.severity,
+                                "matched": alert.matched_text,
+                                "at_sec": alert.triggered_at_sec,
+                            })
 
                     self.status.chunks_processed = chunk_idx + 1
                     self.status.total_segments += segments_stored

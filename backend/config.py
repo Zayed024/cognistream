@@ -194,7 +194,14 @@ KEYFRAME_SEMANTIC_LOOKBACK = int(os.getenv("KEYFRAME_SEMANTIC_LOOKBACK", "10"))
 KEYFRAME_SEMANTIC_MAX_FRAME_GAP = int(os.getenv("KEYFRAME_SEMANTIC_MAX_FRAME_GAP", "180"))
 
 # Streaming / live-video chunk size in seconds
-STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "30"))
+# Lower = faster alerts, higher = better captions per chunk
+# Default 5s for low-latency RTVI-style alerts (NVIDIA VSS 3 inspired)
+STREAM_CHUNK_SEC = int(os.getenv("STREAM_CHUNK_SEC", "5"))
+
+# Chunk overlap in seconds — prevents events from being missed at chunk boundaries
+# (e.g., a person walking through a chunk boundary won't be analyzed twice but won't be missed either)
+# Borrowed from NVIDIA VSS 3 — they use 10s overlap on 60s chunks
+STREAM_CHUNK_OVERLAP_SEC = int(os.getenv("STREAM_CHUNK_OVERLAP_SEC", "1"))
 
 # Live feed segment TTL — auto-delete segments older than this (hours).
 # 0 = keep forever (default for file-based processing).

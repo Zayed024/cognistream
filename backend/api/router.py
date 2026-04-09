@@ -200,6 +200,7 @@ class SearchRequest(BaseModel):
     video_id: Optional[str] = None
     top_k: int = Field(default=10, ge=1, le=_MAX_TOP_K)
     source_filter: Optional[str] = None
+    agentic: bool = Field(default=False, description="Enable agentic search (decompose + VLM rerank)")
 
 
 class SimilarRequest(BaseModel):
@@ -694,6 +695,7 @@ async def search(req: SearchRequest):
         top_k=req.top_k,
         video_id=req.video_id,
         source_filter=req.source_filter,
+        agentic=req.agentic,
     )
 
     return {
@@ -986,6 +988,216 @@ async def get_video_report(video_id: str):
             "items": annotations,
         },
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MCP (Model Context Protocol) tool surface
+# Inspired by NVIDIA VSS 3 — exposes CogniStream as MCP tools so any
+# MCP-compatible client (Claude Desktop, Cursor, etc.) can drive it.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/mcp/tools")
+async def mcp_list_tools():
+    """List all MCP tools exposed by CogniStream."""
+    from backend.mcp_server import list_tools
+    return {"tools": list_tools()}
+
+
+class MCPCallRequest(BaseModel):
+    name: str
+    arguments: dict = Field(default_factory=dict)
+
+
+@router.post("/mcp/call")
+async def mcp_call_tool(req: MCPCallRequest):
+    """Invoke an MCP tool by name with the given arguments."""
+    from backend.mcp_server import call_tool, TOOL_REGISTRY
+    if req.name not in TOOL_REGISTRY:
+        raise HTTPException(404, f"Unknown tool: {req.name}")
+    return call_tool(req.name, req.arguments)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LLM-powered report generation
+# Inspired by NVIDIA Metropolis VSS 3 automatic report generation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ReportGenerateRequest(BaseModel):
+    template: str = "executive"
+    scenario: Optional[str] = Field(default=None, description="Domain context (e.g. 'warehouse aisle')")
+    events_to_track: list[str] = Field(default_factory=list, description="Specific events to look for")
+    objects_of_interest: list[str] = Field(default_factory=list, description="Specific objects to highlight")
+
+
+@router.post("/video/{video_id}/report/generate")
+async def generate_video_report(
+    video_id: str,
+    req: Optional[ReportGenerateRequest] = None,
+    template: str = Query("executive"),
+):
+    """Generate an LLM-summarized report for a video.
+
+    Templates: executive, incident, timeline, activity
+
+    Three-parameter contract (borrowed from NVIDIA VSS 3):
+        - scenario: domain context
+        - events_to_track: specific events
+        - objects_of_interest: specific objects
+
+    Uses NVIDIA cloud Llama if available, otherwise falls back to local Ollama.
+    """
+    meta = _db.get_video(video_id)
+    if meta is None:
+        raise HTTPException(404, f"Video not found: {video_id}")
+
+    from backend.reports import report_generator, REPORT_TEMPLATES
+
+    # Pull params from request body if provided, else from query string
+    if req is not None:
+        chosen_template = req.template
+        scenario = req.scenario
+        events_to_track = req.events_to_track
+        objects_of_interest = req.objects_of_interest
+    else:
+        chosen_template = template
+        scenario = None
+        events_to_track = []
+        objects_of_interest = []
+
+    if chosen_template not in REPORT_TEMPLATES:
+        raise HTTPException(400, f"Unknown template '{chosen_template}'. Available: {list(REPORT_TEMPLATES.keys())}")
+
+    segments = _store.get_by_video(video_id)
+    events = _db.list_events(video_id)
+    annotations = _db.list_annotations(video_id)
+
+    video_meta = {
+        "video_id": meta.id,
+        "filename": meta.filename,
+        "duration_sec": meta.duration_sec,
+    }
+
+    report = report_generator.generate(
+        video_meta=video_meta,
+        segments=segments,
+        events=events,
+        annotations=annotations,
+        template=chosen_template,
+        scenario=scenario,
+        events_to_track=events_to_track,
+        objects_of_interest=objects_of_interest,
+    )
+    return report
+
+
+@router.get("/report/templates")
+async def list_report_templates():
+    """List available LLM report templates."""
+    from backend.reports import REPORT_TEMPLATES
+    return {
+        "templates": [
+            {"id": k, "name": v["name"], "description": v["description"]}
+            for k, v in REPORT_TEMPLATES.items()
+        ]
+    }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Alert rules engine
+# Inspired by NVIDIA Metropolis VSS 3 RTVI alerts
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class AlertRuleRequest(BaseModel):
+    name: str
+    type: str = Field(description="keyword_match | object_count | event_match | anomaly")
+    severity: str = "medium"
+    enabled: bool = True
+    keywords: list[str] = []
+    object_label: str = ""
+    threshold: int = 1
+    window_sec: float = 30.0
+    event_type: str = ""
+    min_confidence: float = 0.5
+    video_ids: list[str] = []
+    webhook: bool = True
+    websocket: bool = True
+
+
+@router.get("/alerts/rules")
+async def list_alert_rules():
+    """List all configured alert rules."""
+    from backend.alerts import alert_engine
+    from dataclasses import asdict
+    return {"rules": [asdict(r) for r in alert_engine.list_rules()]}
+
+
+@router.post("/alerts/rules", status_code=201)
+async def create_alert_rule(req: AlertRuleRequest):
+    """Create a new alert rule."""
+    from backend.alerts import alert_engine
+    from dataclasses import asdict
+    rule = alert_engine.add_rule(req.dict())
+    return asdict(rule)
+
+
+@router.put("/alerts/rules/{rule_id}")
+async def update_alert_rule(rule_id: str, updates: dict):
+    """Update an existing alert rule."""
+    from backend.alerts import alert_engine
+    from dataclasses import asdict
+    rule = alert_engine.update_rule(rule_id, updates)
+    if rule is None:
+        raise HTTPException(404, f"Rule not found: {rule_id}")
+    return asdict(rule)
+
+
+@router.delete("/alerts/rules/{rule_id}")
+async def delete_alert_rule(rule_id: str):
+    """Delete an alert rule."""
+    from backend.alerts import alert_engine
+    if not alert_engine.remove_rule(rule_id):
+        raise HTTPException(404, f"Rule not found: {rule_id}")
+    return {"message": "Rule deleted", "id": rule_id}
+
+
+@router.get("/alerts/history")
+async def alert_history(video_id: Optional[str] = Query(None), limit: int = Query(100)):
+    """Return recent alert events."""
+    from backend.alerts import alert_engine
+    return {"alerts": alert_engine.history(limit=limit, video_id=video_id)}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Use case templates
+# Inspired by NVIDIA Metropolis VSS 3 industry examples
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@router.get("/templates")
+async def list_use_case_templates():
+    """List all available use case templates (surveillance, smart_city, warehouse, etc.)"""
+    from backend.use_case_templates import list_templates
+    return {"templates": list_templates()}
+
+
+@router.get("/templates/{template_id}")
+async def get_use_case_template(template_id: str):
+    """Get details of a specific use case template."""
+    from backend.use_case_templates import get_template
+    from dataclasses import asdict
+    t = get_template(template_id)
+    if t is None:
+        raise HTTPException(404, f"Template not found: {template_id}")
+    return asdict(t)
+
+
+@router.post("/templates/{template_id}/apply")
+async def apply_use_case_template(template_id: str):
+    """Apply a use case template — adds its alert rules to the engine."""
+    from backend.use_case_templates import apply_template
+    result = apply_template(template_id)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

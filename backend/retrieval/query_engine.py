@@ -103,6 +103,7 @@ class QueryEngine:
         top_k: int = DEFAULT_TOP_K,
         video_id: Optional[str] = None,
         source_filter: Optional[str] = None,
+        agentic: bool = False,
     ) -> list[SearchResult]:
         """Execute the full search pipeline.
 
@@ -112,6 +113,8 @@ class QueryEngine:
             video_id:      Scope search to one video (optional).
             source_filter: Restrict to a source type: "visual", "audio",
                            "fused", or "event" (optional).
+            agentic:       If True, run query decomposition + VLM reflection rerank
+                           (VSS 3 agentic search). Slower but better for compound queries.
 
         Returns:
             Up to *top_k* :class:`SearchResult` objects sorted by
@@ -120,6 +123,10 @@ class QueryEngine:
         if not query.strip():
             logger.warning("Empty query — returning no results.")
             return []
+
+        # Agentic mode: decompose, search each sub-query, fuse, then rerank with VLM
+        if agentic:
+            return self.search_agentic(query, top_k, video_id, source_filter)
 
         # Stage 1: embed the query (text embedding)
         logger.info("Search query: '%s'", query)
@@ -204,6 +211,181 @@ class QueryEngine:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Stage 2b: Multi-vector visual search
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Agentic search (VSS 3): decompose → multi-search → fuse → VLM rerank
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def search_agentic(
+        self,
+        query: str,
+        top_k: int = DEFAULT_TOP_K,
+        video_id: Optional[str] = None,
+        source_filter: Optional[str] = None,
+    ) -> list[SearchResult]:
+        """Agentic search: query decomposition + multi-vector + VLM reflection rerank.
+
+        Borrowed from NVIDIA Metropolis VSS 3.
+        """
+        logger.info("Agentic search: '%s'", query)
+
+        # Step 1: Decompose the query into sub-queries
+        sub_queries = self._decompose_query(query)
+        logger.info("Decomposed into %d sub-queries: %s", len(sub_queries), sub_queries)
+
+        # Step 2: Search each sub-query and collect results
+        all_results: dict[str, dict] = {}  # segment_id → result with merged score
+        for sub_q in sub_queries:
+            try:
+                emb = self.embedder.embed_query(sub_q)
+                fetch_k = min(top_k * _OVERFETCH_FACTOR, top_k + 20)
+                sub_results = self.store.query(
+                    embedding=emb,
+                    top_k=fetch_k,
+                    video_id=video_id,
+                    source_filter=source_filter,
+                )
+                # Merge into the global result set, keeping the max score per segment
+                for r in sub_results:
+                    rid = r["id"]
+                    if rid not in all_results or r["score"] > all_results[rid]["score"]:
+                        all_results[rid] = r
+            except Exception as exc:
+                logger.warning("Sub-query '%s' failed: %s", sub_q, exc)
+
+        if not all_results:
+            return []
+
+        # Step 3: Visual search fusion (if visual embeddings exist)
+        if RETRIEVAL_WEIGHT_VISUAL > 0:
+            visual_results = self._visual_search(query, top_k * 2, video_id)
+            if visual_results:
+                merged_list = self._merge_multi_vector(
+                    list(all_results.values()), visual_results,
+                    RETRIEVAL_WEIGHT_TEXT, RETRIEVAL_WEIGHT_VISUAL,
+                )
+                all_results = {r["id"]: r for r in merged_list}
+
+        # Step 4: Temporal re-ranking
+        candidates = list(all_results.values())
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        candidates = candidates[: top_k * 2]
+        candidates = self._temporal_rerank(candidates)
+
+        # Step 5: VLM reflection rerank (top candidates only — expensive)
+        candidates = self._vlm_reflect_rerank(query, candidates[: top_k * 2])
+
+        # Step 6: Format
+        return self._format(candidates[:top_k])
+
+    def _decompose_query(self, query: str) -> list[str]:
+        """Use an LLM to break a compound query into sub-queries.
+
+        Falls back to simple keyword splitting if no LLM is available.
+        """
+        # Try NVIDIA cloud LLM first
+        try:
+            from backend.providers.nvidia import nvidia
+            if nvidia.available:
+                from backend.config import NVIDIA_API_KEY, NVIDIA_BASE_URL
+                import httpx
+                with httpx.Client(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+                    resp = client.post(
+                        f"{NVIDIA_BASE_URL}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": "meta/llama-3.2-11b-vision-instruct",
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You decompose video search queries into 1-4 simpler sub-queries. "
+                                        "Return only the sub-queries, one per line, no numbering or explanation. "
+                                        "If the query is already simple, return it as-is."
+                                    ),
+                                },
+                                {"role": "user", "content": f"Query: {query}\n\nSub-queries:"},
+                            ],
+                            "max_tokens": 200,
+                            "temperature": 0.2,
+                        },
+                    )
+                    if resp.status_code == 200:
+                        text = resp.json()["choices"][0]["message"]["content"]
+                        subs = [
+                            line.strip().lstrip("-•0123456789. ")
+                            for line in text.split("\n")
+                            if line.strip() and len(line.strip()) > 3
+                        ]
+                        if subs:
+                            return subs[:4]
+        except Exception as exc:
+            logger.debug("LLM decomposition failed: %s", exc)
+
+        # Fallback: split on common conjunctions
+        import re
+        parts = re.split(
+            r"\s+(?:and|then|after|before|while|when)\s+",
+            query, flags=re.IGNORECASE,
+        )
+        parts = [p.strip() for p in parts if p.strip()]
+        return parts if len(parts) > 1 else [query]
+
+    def _vlm_reflect_rerank(
+        self, query: str, candidates: list[dict],
+    ) -> list[dict]:
+        """Use a VLM to verify each top candidate matches the query.
+
+        Adjusts scores based on VLM verdict. Skipped if no frame_path on the
+        candidate or no VLM available.
+        """
+        if not candidates:
+            return candidates
+
+        # Use NVIDIA cloud VLM for reflection (fast + accurate)
+        try:
+            from backend.providers.nvidia import nvidia
+            if not nvidia.available:
+                return candidates  # Skip reflection if no VLM
+        except ImportError:
+            return candidates
+
+        from backend.providers.nvidia import nvidia as _nv
+
+        # Only rerank candidates that have a frame_path
+        rerank_count = min(5, len(candidates))  # Top 5 only — VLM calls are expensive
+        for i in range(rerank_count):
+            c = candidates[i]
+            frame = c.get("frame_path")
+            if not frame:
+                continue
+
+            try:
+                prompt = (
+                    f"Does this image match the search query: '{query}'? "
+                    "Answer with a single word: yes, no, or maybe."
+                )
+                answer = _nv.caption_image(frame, prompt) or ""
+                answer = answer.strip().lower()
+
+                # Boost or penalize the score
+                if answer.startswith("yes"):
+                    c["score"] = min(1.0, c["score"] * 1.2)
+                    c["_reflection"] = "yes"
+                elif answer.startswith("no"):
+                    c["score"] = c["score"] * 0.5
+                    c["_reflection"] = "no"
+                else:
+                    c["_reflection"] = "maybe"
+            except Exception as exc:
+                logger.debug("VLM reflection failed for candidate %d: %s", i, exc)
+
+        # Re-sort after reflection adjustments
+        candidates.sort(key=lambda c: c["score"], reverse=True)
+        return candidates
 
     def _visual_search(
         self, query: str, top_k: int, video_id: Optional[str]
