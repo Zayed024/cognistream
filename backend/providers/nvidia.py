@@ -105,7 +105,10 @@ class NvidiaProvider:
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
-                timeout=httpx.Timeout(60.0, connect=10.0),
+                # Short read timeout: if the cloud endpoint is hung or rate-
+                # limited, fail fast so the caller can fall back to YOLO
+                # rather than blocking the whole pipeline.
+                timeout=httpx.Timeout(8.0, connect=10.0),
             )
         return self._grounding_client
 
@@ -258,16 +261,37 @@ class NvidiaProvider:
             # Grounding DINO uses period-separated prompt
             prompt = ". ".join(labels) + "."
 
+            # Cloud NIM expects an OpenAI-chat-style body where content is a
+            # list of items, each item must have type='text' (image_url type
+            # is rejected by the validator). The text field is capped at
+            # 1024 chars so the image must be uploaded as an asset first
+            # and referenced via an HTML <img> tag inside the text. See:
+            # https://docs.api.nvidia.com/nim/reference/nvidia-nv-grounding-dino-infer
+            #
+            # NOTE: this path currently relies on the caller uploading an
+            # asset and replacing the prompt with one containing the
+            # `data:image/jpeg;asset_id,...` reference. For the inline path
+            # below, the cloud endpoint will reject calls with images larger
+            # than ~1KB of base64 (i.e. essentially everything). Local YOLO
+            # via cv_filter is the practical backend.
             resp = self._get_grounding_client().post(
                 NVIDIA_GROUNDING_URL,
                 json={
-                    "input": [
+                    "model": NVIDIA_GROUNDING_MODEL,
+                    "messages": [
                         {
-                            "type": "image_url",
-                            "url": f"data:image/jpeg;base64,{b64}",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f'{prompt} '
+                                        f'<img src="data:image/jpeg;base64,{b64}" />'
+                                    ),
+                                }
+                            ],
                         }
                     ],
-                    "prompt": prompt,
                     "threshold": threshold,
                 },
             )

@@ -513,6 +513,10 @@ class VLMRunner:
         Side effect: stores detections on each kept keyframe via the
         `_cv_detections` attribute, so the VLM analyse step can use them
         for SoM (Set-of-Mark) prompting.
+
+        Fails open at the batch level: if every frame is rejected (likely a
+        broken detector backend rather than a genuinely empty video) the
+        original list is returned untouched, so visual analysis still runs.
         """
         from backend.visual.cv_filter import cv_filter
 
@@ -520,20 +524,31 @@ class VLMRunner:
             return keyframes
 
         kept = []
-        skipped = 0
+        any_detections_seen = False
         for kf in keyframes:
             try:
                 interesting, detections = cv_filter.is_interesting(kf.file_path)
+                if detections:
+                    any_detections_seen = True
                 if interesting:
-                    # Attach detections for downstream SoM use
                     setattr(kf, "_cv_detections", detections)
                     kept.append(kf)
-                else:
-                    skipped += 1
             except Exception:
-                # On any error, keep the frame (fail open)
                 kept.append(kf)
+                any_detections_seen = True  # don't penalise the batch on error
 
+        # If every frame got dropped AND no detector ever returned anything,
+        # the backend is almost certainly broken — pass everything through.
+        if not kept and not any_detections_seen:
+            logger.warning(
+                "CV pre-filter rejected all %d keyframes and never saw any "
+                "detections — assuming detector is unavailable, passing all "
+                "frames through to VLM.",
+                len(keyframes),
+            )
+            return keyframes
+
+        skipped = len(keyframes) - len(kept)
         if skipped > 0:
             logger.info(
                 "CV pre-filter: kept %d / %d keyframes (%d skipped, no interesting objects)",

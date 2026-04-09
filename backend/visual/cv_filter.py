@@ -63,17 +63,24 @@ INTERESTING_LABELS = {
 class CVFilter:
     """Fast pre-filter using NVIDIA Grounding DINO or local YOLO."""
 
+    # If the cloud Grounding DINO call fails this many times in a row, stop
+    # trying for the rest of the process and use the local YOLO backend instead.
+    # Avoids burning quota on a broken/throttled endpoint.
+    _NVIDIA_FAILURE_THRESHOLD = 3
+
     def __init__(self):
         self._yolo_model = None
         self._yolo_tried = False
+        self._nvidia_failures = 0
+        self._nvidia_disabled = False
 
     @property
     def available(self) -> bool:
         """True if at least one backend is available."""
-        from backend.providers.nvidia import nvidia
-        if nvidia.available:
+        if self._try_load_yolo() is not None:
             return True
-        return self._try_load_yolo() is not None
+        from backend.providers.nvidia import nvidia
+        return nvidia.available and not self._nvidia_disabled
 
     def detect(
         self,
@@ -95,13 +102,30 @@ class CVFilter:
         if labels is None:
             labels = list(INTERESTING_LABELS)
 
-        # Try NVIDIA Grounding DINO first (best quality)
-        from backend.providers.nvidia import nvidia
-        if nvidia.available:
-            return self._detect_nvidia(image_path, labels, threshold)
+        # Prefer local YOLO when available — no network round-trip, no
+        # quota, ~30 ms per frame on CPU. Cloud Grounding DINO is only
+        # used as a fallback when ultralytics isn't installed.
+        if self._try_load_yolo() is not None:
+            return self._detect_yolo(image_path, threshold)
 
-        # Fall back to local YOLO
-        return self._detect_yolo(image_path, threshold)
+        # Cloud fallback. Disabled after a streak of failures so we don't
+        # waste HTTP calls on a broken/throttled endpoint.
+        from backend.providers.nvidia import nvidia
+        if nvidia.available and not self._nvidia_disabled:
+            results = self._detect_nvidia(image_path, labels, threshold)
+            if results is not None:
+                self._nvidia_failures = 0
+                return results
+            self._nvidia_failures += 1
+            if self._nvidia_failures >= self._NVIDIA_FAILURE_THRESHOLD:
+                logger.warning(
+                    "NV-Grounding-DINO failed %d times in a row — disabling "
+                    "cloud CV pre-filter for the rest of this session.",
+                    self._nvidia_failures,
+                )
+                self._nvidia_disabled = True
+
+        return []
 
     def is_interesting(self, image_path: str, threshold: float = 0.3) -> tuple[bool, list[Detection]]:
         """Quick check: does this frame contain interesting objects?
@@ -126,12 +150,14 @@ class CVFilter:
 
     def _detect_nvidia(
         self, image_path: str, labels: list[str], threshold: float
-    ) -> list[Detection]:
+    ) -> list[Detection] | None:
+        """Returns None on failure (so the caller can fall back to YOLO),
+        empty list when the call succeeded but found nothing."""
         from backend.providers.nvidia import nvidia
         try:
             results = nvidia.detect_objects(image_path, labels, threshold=threshold)
-            if not results:
-                return []
+            if results is None:
+                return None
             return [
                 Detection(
                     label=str(r.get("label", "object")),
@@ -142,7 +168,7 @@ class CVFilter:
             ]
         except Exception as exc:
             logger.debug("NVIDIA Grounding DINO failed: %s", exc)
-            return []
+            return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Local YOLO backend (via opencv DNN or ultralytics if installed)
