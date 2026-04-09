@@ -1,24 +1,54 @@
-# Dependencies
-frontend/node_modules
+# Python
 __pycache__
 *.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
 
-# Data (mounted as volumes, not baked into images)
+# Data — mounted as volumes, never baked into images
 data/
+models/
+reports/
 
-# Git
+# Frontend — has its own Dockerfile
+frontend/
+
+# Dev tooling not needed at runtime
+scripts/
+notebooks/
+*.ipynb
+cogni/
+
+# Tests + examples
+backend/tests/
+backend/test_*.py
+*_test.py
+test_*.py
+
+# Git / IDE / OS
 .git
 .gitignore
-
-# IDE
+.gitattributes
 .vscode
 .idea
 *.swp
-
-# OS
 .DS_Store
 Thumbs.db
 
+# Docs
+*.md
+docs/
+LICENSE
+
 # Build artifacts
-frontend/dist
-*.egg-info
+build/
+dist/
+*.egg
+
+# CI / config
+.github/
+.claude/

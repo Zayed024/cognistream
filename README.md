@@ -46,51 +46,90 @@ The pipeline auto-detects model capabilities and adjusts (4-pass prompts for sma
 
 ## Quick Start
 
-### Prerequisites
+CogniStream supports three deployment modes. Pick the one that matches your hardware:
 
-- Python 3.11+, Node.js 20+, FFmpeg
-- [Ollama](https://ollama.com/) installed
-- NVIDIA GPU recommended (RTX 3050+ with 6GB VRAM)
+| Mode | Best for | GPU? | VLM | STT |
+|---|---|---|---|---|
+| **Host with GPU** | Dev machines / workstations with NVIDIA GPU | ✅ CUDA | Local Ollama (GPU) or NVIDIA cloud | Faster-Whisper (GPU) |
+| **Host CPU-only** | Laptops without NVIDIA, CI runners | ❌ | NVIDIA cloud (recommended) or Ollama (CPU, slow) | Faster-Whisper (CPU) or NVIDIA cloud |
+| **Docker** | Servers / edge boxes / reproducible deploys | ❌ (CPU image) | NVIDIA cloud or sibling Ollama container | Whisper (CPU, base model) |
 
-### Setup
+### Option 1: Host with GPU (recommended for dev)
+
+**Prerequisites**: Python 3.11+, Node.js 20+, FFmpeg, NVIDIA GPU + CUDA 12 drivers, [Ollama](https://ollama.com/)
 
 ```bash
 # Clone
 git clone https://github.com/Zayed024/cognistream.git && cd cognistream
 
-# Install Python deps
+# Install Python deps (will pull CUDA torch)
 pip install -r requirements.txt
 
-# Pull VLM model
+# Optional: install YOLO for the CV pre-filter (~30% faster pipeline)
+pip install ultralytics
+
+# Pull the local VLM
 ollama pull moondream
 
-# Install frontend
+# Frontend deps
 cd frontend && npm install && cd ..
 
-# Copy and edit config
+# Config — set NVIDIA_API_KEY if you want cloud VLM/embeddings
 cp .env.example .env
 ```
 
-### Run
+Run with three terminals:
 
 ```bash
-# Terminal 1: Ollama
+# Terminal 1
 ollama serve
 
-# Terminal 2: Backend
+# Terminal 2
 uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
-# Terminal 3: Frontend
+# Terminal 3
 cd frontend && npm run dev
 ```
 
 Open http://localhost:3000
 
-### Docker
+### Option 2: Host CPU-only
+
+Same as Option 1 but skip the Ollama install and force CPU Whisper:
 
 ```bash
-cd docker && docker compose up --build
+# In .env:
+WHISPER_DEVICE=cpu
+WHISPER_MODEL_SIZE=base   # or "tiny" if RAM-constrained
+NVIDIA_API_KEY=nvapi-...  # strongly recommended — local Ollama on CPU is very slow
 ```
+
+Then run just two terminals (skip `ollama serve`):
+
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+cd frontend && npm run dev
+```
+
+The pipeline will use NVIDIA cloud for the VLM and embeddings, and Faster-Whisper on CPU for transcription.
+
+### Option 3: Docker (CPU-only)
+
+The Docker image is intentionally CPU-only — no `nvidia-cu12-*` packages, no CUDA runtime. Image size is ~3.5 GB. If you need GPU acceleration, use Option 1 instead.
+
+```bash
+cd docker
+docker compose up -d --build
+```
+
+This brings up four services: `backend`, `frontend`, `chromadb`, `ollama` (sibling container, CPU mode). The backend container talks to the sibling Ollama for the VLM. For acceptable speed in this mode, set `NVIDIA_API_KEY` in `docker-compose.yml` so the backend uses NVIDIA cloud instead of CPU Ollama.
+
+Open http://localhost:3000.
+
+To rebuild after pulling new code: `docker compose up -d --build backend`. To stop: `docker compose down`.
+
+#### Why is the Docker image CPU-only?
+The `python:3.11-slim` base image has no CUDA runtime, the compose file doesn't request GPU devices, and CUDA libraries can't talk to a GPU without the host's NVIDIA Container Toolkit installed. Bundling them anyway adds 6+ GB of unusable bloat — which is exactly the trap the previous 14.6 GB image fell into. If you need GPU inside Docker, you'd need a different base image (`nvidia/cuda:12.x-runtime`), GPU torch (`--index-url https://download.pytorch.org/whl/cu121`), and a `devices: [{ driver: nvidia }]` block in `docker-compose.yml`. Happy to add that as an opt-in `Dockerfile.backend.gpu` if anyone needs it.
 
 ## API Reference
 

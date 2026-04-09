@@ -80,6 +80,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.backend
+    image: cognistream-backend:latest
     container_name: cognistream-backend
     volumes:
       - app_data:/app/data
