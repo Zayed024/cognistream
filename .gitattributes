@@ -1,1 +1,2 @@
 models/cognistream-embedder/model.safetensors filter=lfs diff=lfs merge=lfs -text
+models/cognistream-moondream-lora/adapter_model.safetensors filter=lfs diff=lfs merge=lfs -text
