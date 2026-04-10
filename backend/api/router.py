@@ -140,7 +140,7 @@ def _queue_worker() -> None:
 _db = SQLiteDB()
 _store = ChromaStore()
 _embedder = MultimodalEmbedder()
-_query_engine = QueryEngine(embedder=_embedder, store=_store)
+_query_engine = QueryEngine(embedder=_embedder, store=_store, db=_db)
 _orchestrator = PipelineOrchestrator(db=_db, store=_store, on_progress=_on_progress)
 
 # ── Live feed WebSocket management ──
@@ -200,7 +200,9 @@ class SearchRequest(BaseModel):
     video_id: Optional[str] = None
     top_k: int = Field(default=10, ge=1, le=_MAX_TOP_K)
     source_filter: Optional[str] = None
+    search_mode: str = Field(default="hybrid", description="Search mode: 'visual' (vector only), 'speech' (FTS5 only), 'hybrid' (both)")
     agentic: bool = Field(default=False, description="Enable agentic search (decompose + VLM rerank)")
+    min_score: float = Field(default=0.0, ge=0.0, le=1.0, description="Minimum score threshold — results below this are filtered out")
 
 
 class SimilarRequest(BaseModel):
@@ -695,11 +697,14 @@ async def search(req: SearchRequest):
         top_k=req.top_k,
         video_id=req.video_id,
         source_filter=req.source_filter,
+        search_mode=req.search_mode,
         agentic=req.agentic,
+        min_score=req.min_score,
     )
 
     return {
         "query": req.query,
+        "result_count": len(results),
         "results": [
             {
                 "video_id": r.video_id,
@@ -711,6 +716,8 @@ async def search(req: SearchRequest):
                 "score": r.score,
                 "event_type": r.event_type,
                 "frame_url": r.frame_url,
+                "speech_snippet": r.speech_snippet,
+                "related_count": r.related_count,
             }
             for r in results
         ],

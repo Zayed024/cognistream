@@ -321,6 +321,20 @@ class PipelineOrchestrator:
                     _stop_timer("transcription_sec")
                     self._emit(progress, 5, "Audio transcription complete")
 
+            # Persist raw transcripts in SQLite for FTS5 speech search.
+            # This runs BEFORE fusion so the original Whisper text is
+            # searchable independently of the fused embeddings.
+            if transcripts:
+                try:
+                    saved = self.db.save_transcripts(video_meta.id, transcripts)
+                    overlaps = self.db.save_transcript_overlaps(video_meta.id, transcripts)
+                    logger.info(
+                        "Persisted %d transcript segments + %d overlaps for FTS5.",
+                        saved, overlaps,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to persist transcripts: %s", exc)
+
             # ── Stage 6b: Visual frame embeddings (NVCLIP or SigLIP) ─
             from backend.providers.nvidia import nvidia
             import uuid as _uuid
@@ -380,6 +394,21 @@ class PipelineOrchestrator:
             self._emit(progress, 6, "Multimodal fusion")
             _start_timer("fusion_embedding_sec")
             fused: list = []
+
+            # Pipelined writes: store visual segments (already embedded by
+            # NVCLIP/SigLIP) in a background thread while text fusion +
+            # embedding computes. This removes the visual write from the
+            # critical path. Borrowed from Moment Search's pendingQdrantWrite
+            # pattern.
+            visual_write_future: Future | None = None
+            if visual_segments:
+                def _store_visual():
+                    self.store.purge_video(meta.id)
+                    return self.store.add_segments(visual_segments)
+                visual_write_future = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="chroma-write",
+                ).submit(_store_visual)
+
             if not captions and not transcripts:
                 msg = "No captions or transcripts — skipping fusion (video metadata still saved)."
                 logger.warning(msg)
@@ -389,8 +418,23 @@ class PipelineOrchestrator:
                 fused = embedder.fuse_and_embed(meta.id, captions, transcripts)
             _stop_timer("fusion_embedding_sec")
 
-            # Add NVCLIP image segments (already have embeddings, skip re-embedding)
-            if visual_segments:
+            # Wait for visual write if it was pipelined
+            visual_stored = 0
+            if visual_write_future is not None:
+                try:
+                    visual_stored = visual_write_future.result(timeout=30)
+                    logger.info("Pipelined visual write: %d segments stored.", visual_stored)
+                except Exception as exc:
+                    logger.warning("Pipelined visual write failed: %s", exc)
+                    # Fall back to inline storage below
+                    visual_segments_remaining = visual_segments
+                    fused.extend(visual_segments_remaining)
+                    visual_segments = []
+
+            if visual_segments and visual_stored > 0:
+                # Already stored — don't re-add
+                pass
+            elif visual_segments:
                 fused.extend(visual_segments)
 
             # ── Stage 8: Knowledge graph ───────────────────────
@@ -424,13 +468,15 @@ class PipelineOrchestrator:
             # ── Stage 10: Store to ChromaDB ────────────────────
             self._emit(progress, 9, "Storing embeddings")
             _start_timer("store_sec")
-            # Purge old data for this video (idempotent reprocessing)
-            self.store.purge_video(meta.id)
+            # Purge if visual pipelining didn't already do it
+            if visual_write_future is None:
+                self.store.purge_video(meta.id)
             if fused:
-                result.segments_stored = self.store.add_segments(fused)
+                result.segments_stored = self.store.add_segments(fused) + visual_stored
             else:
-                result.segments_stored = 0
-                logger.info("No segments to store — video processed without searchable content.")
+                result.segments_stored = visual_stored
+                if not visual_stored:
+                    logger.info("No segments to store — video processed without searchable content.")
             _stop_timer("store_sec")
 
             # ── Finalise ───────────────────────────────────────
