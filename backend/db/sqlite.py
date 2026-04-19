@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS videos (
 
 CREATE TABLE IF NOT EXISTS segments (
     id          TEXT PRIMARY KEY,
-    video_id    TEXT NOT NULL REFERENCES videos(id),
+    video_id    TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     start_time  REAL NOT NULL,
     end_time    REAL NOT NULL,
     text        TEXT NOT NULL,
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS segments (
 
 CREATE TABLE IF NOT EXISTS events (
     id          TEXT PRIMARY KEY,
-    video_id    TEXT NOT NULL REFERENCES videos(id),
+    video_id    TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     event_type  TEXT NOT NULL,
     start_time  REAL NOT NULL,
     end_time    REAL NOT NULL,
@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS annotations (
     id          TEXT PRIMARY KEY,
-    video_id    TEXT NOT NULL REFERENCES videos(id),
+    video_id    TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     start_time  REAL NOT NULL,
     end_time    REAL NOT NULL,
     label       TEXT NOT NULL,
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS annotations (
 
 CREATE TABLE IF NOT EXISTS benchmark_runs (
     id              TEXT PRIMARY KEY,
-    video_id        TEXT NOT NULL REFERENCES videos(id),
+    video_id        TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
     captured_at     TEXT NOT NULL,
     success         INTEGER NOT NULL,
     elapsed_sec     REAL NOT NULL DEFAULT 0,

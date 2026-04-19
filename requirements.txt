@@ -9,7 +9,7 @@ python-dotenv==1.0.1
 
 # Video / audio processing
 opencv-python-headless==4.11.0.86
-numpy>=1.26,<2.0
+numpy>=1.26
 
 # Speech-to-text
 faster-whisper==1.1.1
