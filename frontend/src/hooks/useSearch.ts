@@ -1,12 +1,14 @@
 import { useCallback, useState } from "react";
 import { searchVideos } from "../api/client";
-import type { SearchResult } from "../types";
+import type { SearchResult, SearchMode } from "../types";
 
 interface UseSearchReturn {
   results: SearchResult[];
   isLoading: boolean;
   error: string | null;
   query: string;
+  searchMode: SearchMode;
+  setSearchMode: (mode: SearchMode) => void;
   search: (query: string) => Promise<void>;
   clear: () => void;
   setResults: (results: SearchResult[]) => void;
@@ -17,6 +19,7 @@ export function useSearch(videoId?: string): UseSearchReturn {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<SearchMode>("hybrid");
 
   const search = useCallback(async (q: string) => {
     const trimmed = q.trim();
@@ -31,6 +34,7 @@ export function useSearch(videoId?: string): UseSearchReturn {
         query: trimmed,
         video_id: videoId,
         top_k: 20,
+        search_mode: searchMode,
       });
       setResults(response.results);
     } catch (err) {
@@ -41,7 +45,7 @@ export function useSearch(videoId?: string): UseSearchReturn {
     } finally {
       setIsLoading(false);
     }
-  }, [videoId]);
+  }, [videoId, searchMode]);
 
   const clear = useCallback(() => {
     setResults([]);
@@ -49,5 +53,5 @@ export function useSearch(videoId?: string): UseSearchReturn {
     setError(null);
   }, []);
 
-  return { results, isLoading, error, query, search, clear, setResults };
+  return { results, isLoading, error, query, searchMode, setSearchMode, search, clear, setResults };
 }

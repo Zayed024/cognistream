@@ -189,6 +189,20 @@ class SQLiteDB:
         conn = sqlite3.connect(self._db_path)
         try:
             conn.executescript(_SCHEMA)
+            # Forward-compatible column migrations for existing DBs.
+            # CREATE TABLE IF NOT EXISTS won't add columns to tables that
+            # already exist, so we use ALTER TABLE with duplicate-column
+            # error suppression.
+            for col, typ, default in [
+                ("bitrate_kbps", "INTEGER", "0"),
+                ("codec", "TEXT", "''"),
+                ("pix_fmt", "TEXT", "''"),
+                ("needs_thumbnail_preview", "INTEGER", "0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {typ} DEFAULT {default}")
+                except Exception:
+                    pass  # column already exists
             try:
                 conn.executescript(_FTS5_SCHEMA)
                 self._fts5_available = True

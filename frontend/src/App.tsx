@@ -26,7 +26,7 @@ export default function App() {
 
   // Search hook - pass video_id when in scoped search view
   const searchVideoId = view === "search" ? selectedVideo?.video_id : undefined;
-  const { results, isLoading, error, query, search, clear, setResults } = useSearch(
+  const { results, isLoading, error, query, searchMode, setSearchMode, search, clear, setResults } = useSearch(
     searchVideoId
   );
   const {
@@ -243,7 +243,7 @@ export default function App() {
       ) : view === "global-search" ? (
         <>
           <section style={styles.searchSection}>
-            <SearchBar onSearch={handleSearch} onClear={handleClear} isLoading={isLoading} />
+            <SearchBar onSearch={handleSearch} onClear={handleClear} isLoading={isLoading} searchMode={searchMode} onSearchModeChange={setSearchMode} />
           </section>
           <div style={styles.resultsFullWidth}>
             <ResultsPanel
@@ -270,7 +270,7 @@ export default function App() {
 
           {/* Search */}
           <section style={styles.searchSection}>
-            <SearchBar onSearch={handleSearch} onClear={handleClear} isLoading={isLoading} />
+            <SearchBar onSearch={handleSearch} onClear={handleClear} isLoading={isLoading} searchMode={searchMode} onSearchModeChange={setSearchMode} />
           </section>
 
           {/* Player + Results */}

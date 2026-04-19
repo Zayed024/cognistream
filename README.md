@@ -122,7 +122,7 @@ cd docker
 docker compose up -d --build
 ```
 
-This brings up four services: `backend`, `frontend`, `chromadb`, `ollama` (sibling container, CPU mode). The backend container talks to the sibling Ollama for the VLM. For acceptable speed in this mode, set `NVIDIA_API_KEY` in `docker-compose.yml` so the backend uses NVIDIA cloud instead of CPU Ollama.
+This brings up three services: `backend`, `frontend`, `chromadb`. Ollama is disabled by default (CPU-only container is too slow). Set `NVIDIA_API_KEY` in `docker-compose.yml` so the backend uses NVIDIA cloud for the VLM. To re-enable Ollama as a sibling container, uncomment the `ollama` service block in `docker/docker-compose.yml`.
 
 Open http://localhost:3000.
 
@@ -139,7 +139,7 @@ The `python:3.11-slim` base image has no CUDA runtime, the compose file doesn't 
 |--------|----------|-------------|
 | `POST` | `/ingest-video` | Upload video (streaming, max 2 GB) |
 | `POST` | `/process-video` | Process video (`standard` or `streaming` mode) |
-| `POST` | `/search` | Natural language search |
+| `POST` | `/search` | Natural language search (see Search below) |
 | `GET` | `/videos` | List all videos |
 | `GET` | `/video/{id}` | Video metadata + status |
 | `GET` | `/video/{id}/stream` | Stream video file |
@@ -171,6 +171,48 @@ The `python:3.11-slim` base image has no CUDA runtime, the compose file doesn't 
 | `POST` | `/process-batch` | Queue multiple videos |
 | `GET` | `/stats` | Dashboard analytics |
 | `GET` | `/health` | Health check + provider status |
+
+### Search
+
+The `/search` endpoint accepts a JSON body with these parameters:
+
+```json
+{
+  "query": "person wearing sunglasses",
+  "top_k": 10,
+  "search_mode": "hybrid",
+  "min_score": 0.0,
+  "agentic": false
+}
+```
+
+| Parameter | Default | Description |
+|---|---|---|
+| `query` | *(required)* | Natural language text, or `"quoted phrase"` for exact transcript match |
+| `top_k` | `10` | Max results to return |
+| `search_mode` | `hybrid` | `visual` (vector only), `speech` (FTS5 transcript only), `hybrid` (both) |
+| `min_score` | `0.0` | Minimum score threshold — results below this are filtered out. Returns empty instead of low-confidence noise. |
+| `agentic` | `false` | Enable query decomposition + VLM reflection rerank (slower, better for compound queries) |
+| `video_id` | `null` | Scope search to one video |
+| `source_filter` | `null` | Restrict to source type: `visual`, `audio`, `fused`, `speech`, `event` |
+
+**Search modes:**
+
+- **`hybrid`** (default) — runs both vector similarity search (visual/caption embeddings) and FTS5 full-text search over transcripts, then merges results. Speech matches get injected with highlighted snippets.
+- **`visual`** — vector search only. Skips transcript matching. Fastest mode.
+- **`speech`** — FTS5 transcript search only. Skips visual embeddings. Returns transcript segments with `<mark>` highlighted snippets.
+
+**Quoted-phrase exact match:**
+
+Wrapping the query in quotes (`"you know the rules"`) routes directly to FTS5 for verbatim transcript search, bypassing the vector pipeline entirely. Supports both straight quotes and smart quotes.
+
+**Response includes:**
+
+| Field | Description |
+|---|---|
+| `speech_snippet` | FTS5 highlighted match with `<mark>` tags (e.g. `You know the <mark>rules</mark>`) |
+| `related_count` | Number of adjacent frames collapsed into this moment (0 = standalone) |
+| `result_count` | Total results returned (top-level field) |
 
 ## Project Structure
 
