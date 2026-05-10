@@ -402,10 +402,14 @@ export async function getLiveFeedStatus(): Promise<LiveFeedInfo[]> {
 export function connectLiveWebSocket(
   videoId: string,
   onEvent: (event: LiveWsEvent) => void,
-  onClose?: () => void
-): { send: (msg: Record<string, unknown>) => void; close: () => void } {
+  onClose?: () => void,
+  onOpen?: () => void,
+  onError?: (err: string) => void
+): { send: (msg: Record<string, unknown>) => void; close: () => void; isOpen: () => boolean } {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${window.location.host}/api/ws/live/${videoId}`);
+
+  ws.onopen = () => onOpen?.();
 
   ws.onmessage = (event) => {
     try {
@@ -419,7 +423,10 @@ export function connectLiveWebSocket(
   };
 
   ws.onclose = () => onClose?.();
-  ws.onerror = () => onClose?.();
+  ws.onerror = () => {
+    onError?.("WebSocket connection error");
+    onClose?.();
+  };
 
   return {
     send: (msg) => {
@@ -428,6 +435,7 @@ export function connectLiveWebSocket(
       }
     },
     close: () => ws.close(),
+    isOpen: () => ws.readyState === WebSocket.OPEN,
   };
 }
 

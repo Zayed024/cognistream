@@ -311,7 +311,9 @@ export default function LiveView({ onBack }: LiveViewProps) {
             addLog("info", `${event.event_type}: ${JSON.stringify(event.data)}`);
         }
       },
-      () => addLog("info", "WebSocket disconnected")
+      () => addLog("info", "WebSocket disconnected"),
+      () => addLog("info", "WebSocket connected"),
+      (err: string) => addLog("error", err),
     );
     wsRef.current = conn;
   };

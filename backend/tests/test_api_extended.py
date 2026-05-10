@@ -952,9 +952,12 @@ def test_browser_chunk_missing_video_data(mocks):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def test_browser_stop_nonexistent_feed(mocks):
-    """Stopping a browser feed that doesn't exist returns 404."""
+    """Stopping a browser feed that doesn't exist is idempotent — returns 200
+    with an "already closed" message rather than 404, so double-clicking the
+    UI Stop button doesn't surface a confusing error."""
     resp = mocks["client"].post("/live/browser-stop?video_id=ghost")
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert "already closed" in resp.json()["message"].lower()
 
 
 def test_browser_stop_existing_feed(mocks):

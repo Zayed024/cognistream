@@ -163,12 +163,17 @@ def _on_live_event(event: LiveEvent) -> None:
     })
     for ws in clients:
         try:
+            # Coroutines must be created in the event loop's thread, not in
+            # the streaming background thread. Wrap in a lambda so the
+            # coroutine is constructed at scheduling time, not at call_soon
+            # invocation time. Without this fix, messages never reach the
+            # client because the coroutine is evaluated in the wrong thread
+            # context and silently dropped.
             _event_loop.call_soon_threadsafe(
-                asyncio.ensure_future,
-                ws.send_text(payload),
+                lambda w=ws, p=payload: asyncio.ensure_future(w.send_text(p))
             )
-        except Exception:
-            pass  # Client may have disconnected
+        except Exception as exc:
+            logger.debug("Failed to schedule WS send: %s", exc)
 
 
 _streaming_pipeline = StreamingPipeline(
@@ -1578,13 +1583,21 @@ async def upload_browser_chunk(
             mp4_path,
         ]
         convert_result = subprocess.run(convert_cmd, capture_output=True, timeout=60)
-        if convert_result.returncode == 0 and Path(mp4_path).stat().st_size > 500:
+        # Defensive: stat() on a non-existent file raises FileNotFoundError.
+        # FFmpeg may exit 0 without producing output on edge cases, so always
+        # check existence before checking size.
+        mp4_ok = False
+        if convert_result.returncode == 0:
+            try:
+                mp4_ok = Path(mp4_path).stat().st_size > 500
+            except (FileNotFoundError, OSError):
+                mp4_ok = False
+        if mp4_ok:
             video_chunk_path = mp4_path
         else:
-            # Fallback: try the raw webm
             video_chunk_path = tmp_path
             mp4_path = None
-            logger.warning("FFmpeg webm→mp4 conversion failed, using raw webm")
+            logger.warning("FFmpeg webm->mp4 conversion failed, using raw webm")
 
         # Extract keyframes from the chunk video
         cap = _cv2.VideoCapture(video_chunk_path)
@@ -1742,6 +1755,21 @@ async def upload_browser_chunk(
             "keyframes_extracted": len(keyframes),
         }
 
+    except Exception:
+        # If processing failed on the FIRST chunk (chunk_index == 0) and we
+        # just created the feed entry, tear it down to avoid leaking the
+        # MultimodalEmbedder. Subsequent chunks (idx > 0) leave the feed
+        # in place so the user can recover by retrying.
+        if chunk_index == 0:
+            with _browser_feeds_lock:
+                stale = _browser_feeds.pop(video_id, None)
+            if stale is not None:
+                try:
+                    stale.get("embedder").unload_model()
+                except Exception:
+                    pass
+        raise
+
     finally:
         Path(tmp_path).unlink(missing_ok=True)
         # Clean up converted mp4 if it exists
@@ -1751,35 +1779,48 @@ async def upload_browser_chunk(
 
 @router.post("/live/browser-stop")
 async def stop_browser_feed(video_id: str = Query(...)):
-    """Finalize a browser camera feed — build knowledge graph and clean up."""
+    """Finalize a browser camera feed — build knowledge graph and clean up.
+
+    Idempotent: returning 200 even if the feed is already closed avoids
+    confusing UI errors when the user double-clicks Stop.
+    """
     with _browser_feeds_lock:
         feed = _browser_feeds.pop(video_id, None)
 
     if feed is None:
-        raise HTTPException(404, f"No browser feed: {video_id}")
+        return {
+            "video_id": video_id,
+            "message": "Browser feed already closed or not found.",
+            "events_detected": 0,
+        }
 
-    # Build knowledge graph in background
     captions = feed["all_captions"]
     transcripts = feed["all_transcripts"]
     embedder = feed["embedder"]
+    events = []
 
-    if captions or transcripts:
-        from backend.knowledge.graph import KnowledgeGraph
-        from backend.knowledge.event_detector import EventDetector
+    try:
+        if captions or transcripts:
+            from backend.knowledge.graph import KnowledgeGraph
+            from backend.knowledge.event_detector import EventDetector
 
-        kg = KnowledgeGraph(video_id)
-        kg.build_from_captions(captions, transcripts)
-        kg.save()
+            kg = KnowledgeGraph(video_id)
+            kg.build_from_captions(captions, transcripts)
+            kg.save()
 
-        detector = EventDetector()
-        events = detector.detect(kg)
-        if events:
-            from backend.pipeline.streaming import StreamingPipeline
-            event_segments = StreamingPipeline._events_to_segments(video_id, events)
-            embedder.embed(event_segments)
-            _store.add_segments(event_segments)
-
-    embedder.unload_model()
+            detector = EventDetector()
+            events = detector.detect(kg)
+            if events:
+                from backend.pipeline.streaming import StreamingPipeline
+                event_segments = StreamingPipeline._events_to_segments(video_id, events)
+                embedder.embed(event_segments)
+                _store.add_segments(event_segments)
+    finally:
+        # Always unload the embedder, even if KG/event detection raised.
+        try:
+            embedder.unload_model()
+        except Exception as exc:
+            logger.debug("Embedder unload failed during browser-stop: %s", exc)
 
     return {
         "video_id": video_id,
