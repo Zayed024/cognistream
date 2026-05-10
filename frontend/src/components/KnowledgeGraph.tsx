@@ -141,6 +141,17 @@ export default function KnowledgeGraph({ videoId, onClose }: KnowledgeGraphProps
     canvas.style.height = `${canvasSize.height}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    // Performance: stop the animation when the layout converges. Without this
+    // we burn 60 fps × O(N^2) force calculations forever, which is what makes
+    // the graph feel slow on local — for 100+ nodes this blocks the main
+    // thread continuously.
+    let stableFrames = 0;
+    const STABLE_THRESHOLD = 30;       // ~0.5 s of low motion
+    const ENERGY_THRESHOLD = 0.05;     // total KE below this = "stable"
+    // For very large graphs, skip the O(N^2) repulsion entirely. Spring
+    // forces alone produce a usable layout above ~150 nodes.
+    const SKIP_REPULSION_ABOVE = 150;
+
     const tick = () => {
       const width = canvasSize.width;
       const height = canvasSize.height;
@@ -156,7 +167,7 @@ export default function KnowledgeGraph({ videoId, onClose }: KnowledgeGraphProps
         }
       }
 
-      if (nodes.length > 1) {
+      if (nodes.length > 1 && nodes.length <= SKIP_REPULSION_ABOVE) {
         for (let i = 0; i < nodes.length; i += 1) {
           for (let j = i + 1; j < nodes.length; j += 1) {
             const a = nodes[i];
@@ -198,12 +209,14 @@ export default function KnowledgeGraph({ videoId, onClose }: KnowledgeGraphProps
         node.vy += (height / 2 - node.y) * 0.0012;
       }
 
+      let totalEnergy = 0;
       for (const node of nodes) {
         if (dragRef.current?.nodeId === node.id) continue;
         node.vx *= 0.84;
         node.vy *= 0.84;
         node.x = clamp(node.x + node.vx, 28, width - 28);
         node.y = clamp(node.y + node.vy, 28, height - 28);
+        totalEnergy += node.vx * node.vx + node.vy * node.vy;
       }
 
       ctx.clearRect(0, 0, width, height);
@@ -240,7 +253,17 @@ export default function KnowledgeGraph({ videoId, onClose }: KnowledgeGraphProps
         drawNode(ctx, node, hoveredNodeId === node.id, selectedNodeId === node.id, connectedNodeIds.has(node.id));
       }
 
-      animRef.current = requestAnimationFrame(tick);
+      // Stop the animation once the layout has converged. Drag / hover /
+      // resize re-trigger this useEffect and restart the loop from scratch,
+      // so the layout always settles after user interaction.
+      if (totalEnergy < ENERGY_THRESHOLD && !dragRef.current) {
+        stableFrames += 1;
+      } else {
+        stableFrames = 0;
+      }
+      if (stableFrames < STABLE_THRESHOLD) {
+        animRef.current = requestAnimationFrame(tick);
+      }
     };
 
     animRef.current = requestAnimationFrame(tick);
