@@ -93,9 +93,11 @@ EMBEDDING_DIM = 384  # local model dimension
 
 # SigLIP visual embedding — embeds frames directly into a text-searchable vector space.
 # Enables visual similarity search without VLM captioning (much faster).
-# Set to empty string to disable.
+# Set to empty string to disable (avoids dimension mismatch with text embeddings).
 SIGLIP_MODEL = os.getenv("SIGLIP_MODEL", "google/siglip2-base-patch16-224")
 SIGLIP_DIM = 768
+# Easy toggle: set SIGLIP_ENABLED=false in .env to skip visual embeddings altogether
+SIGLIP_ENABLED = os.getenv("SIGLIP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 # When NVIDIA is enabled, embeddings are 1024-dim (NV-EmbedQA-E5-V5).
 # ChromaDB collections are dimension-locked, so we use a separate

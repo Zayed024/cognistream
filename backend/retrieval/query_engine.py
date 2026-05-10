@@ -39,6 +39,7 @@ from backend.config import (
     RETRIEVAL_WEIGHT_AUDIO,
     RETRIEVAL_WEIGHT_TEXT,
     RETRIEVAL_WEIGHT_VISUAL,
+    SIGLIP_ENABLED,
 )
 from backend.db.chroma_store import ChromaStore
 from backend.db.models import SearchResult
@@ -171,7 +172,8 @@ class QueryEngine:
         # Stage 2b: visual embedding search (SigLIP/NVCLIP)
         # Search with the visual embedding of the query text to find
         # matching frames that were embedded with SigLIP/NVCLIP.
-        if RETRIEVAL_WEIGHT_VISUAL > 0:
+        # Skip if SigLIP is disabled (to avoid dimension mismatch).
+        if RETRIEVAL_WEIGHT_VISUAL > 0 and SIGLIP_ENABLED:
             visual_results = self._visual_search(query, fetch_k, video_id)
             if visual_results:
                 raw_results = self._merge_multi_vector(

@@ -323,10 +323,11 @@ class PipelineOrchestrator:
 
             # ── Stage 6b: Visual frame embeddings (NVCLIP or SigLIP) ─
             from backend.providers.nvidia import nvidia
+            from backend.config import SIGLIP_ENABLED
             import uuid as _uuid
             visual_segments: list[FusedSegment] = []
 
-            if keyframes:
+            if keyframes and SIGLIP_ENABLED:
                 image_paths = [kf.file_path for kf in keyframes]
                 clip_vectors = None
 

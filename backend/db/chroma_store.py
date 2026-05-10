@@ -144,6 +144,26 @@ class ChromaStore:
             documents.append(seg.text)
             metadatas.append(self._segment_metadata(seg))
 
+        # Validate all embeddings have the same dimension
+        if embeddings:
+            dimensions = set(len(e) for e in embeddings)
+            if len(dimensions) > 1:
+                dim_counts = {}
+                for e in embeddings:
+                    dim = len(e)
+                    dim_counts[dim] = dim_counts.get(dim, 0) + 1
+                logger.error(
+                    "Embedding dimension mismatch detected! Found %d different dimensions: %s. "
+                    "This usually means SigLIP (768-dim) is being mixed with text embeddings (384-dim). "
+                    "Fix: Set SIGLIP_MODEL='' in .env to disable SigLIP, or use separate collections.",
+                    len(dimensions),
+                    dim_counts,
+                )
+                raise ValueError(
+                    f"Inconsistent embedding dimensions: {dim_counts}. "
+                    "See logs for troubleshooting. Likely SigLIP + text embedding mismatch."
+                )
+
         if not ids:
             logger.warning("No valid segments to store.")
             return 0

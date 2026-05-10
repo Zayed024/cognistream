@@ -23,6 +23,8 @@ data/frames/
 data/graphs/
 data/db/
 
+presentables
+
 # Model files / weights
 *.bin
 *.pt
@@ -75,7 +77,7 @@ cogni/
 *.temp
 *.bak
 *.swp
-reports/
+# reports/
 
 # NVIDIA / Secrets
 .nvidia-api-key
