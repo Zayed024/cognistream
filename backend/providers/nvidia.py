@@ -36,6 +36,7 @@ from backend.config import (
     NVIDIA_GROUNDING_MODEL,
     NVIDIA_GROUNDING_URL,
     NVIDIA_VLM_MODEL,
+    EMBEDDING_DIM,
     is_nvidia_enabled,
 )
 
@@ -53,6 +54,17 @@ class NvidiaProvider:
 
     _FAILURE_THRESHOLD = 3
     _DISABLE_SECONDS = 300
+
+    def _adjust_dim(self, vec: list[float] | None) -> list[float] | None:
+        """Adjust embedding vector to configured EMBEDDING_DIM by truncation or zero-pad."""
+        if vec is None:
+            return None
+        desired = EMBEDDING_DIM if isinstance(EMBEDDING_DIM, int) else 384
+        if len(vec) == desired:
+            return vec
+        if len(vec) > desired:
+            return vec[:desired]
+        return vec + [0.0] * (desired - len(vec))
 
     @property
     def available(self) -> bool:
@@ -144,7 +156,7 @@ class NvidiaProvider:
             resp.raise_for_status()
             data = resp.json()
             self._record_success()
-            return data["data"][0]["embedding"]
+            return self._adjust_dim(data["data"][0]["embedding"])
         except Exception as exc:
             self._record_failure(exc)
             logger.warning("NVCLIP image embed failed: %s", exc)
@@ -171,7 +183,7 @@ class NvidiaProvider:
             resp.raise_for_status()
             data = resp.json()
             self._record_success()
-            return [item["embedding"] for item in data["data"]]
+            return [self._adjust_dim(item["embedding"]) for item in data["data"]]
         except Exception as exc:
             self._record_failure(exc)
             logger.warning("NVCLIP batch image embed failed: %s", exc)
@@ -200,7 +212,7 @@ class NvidiaProvider:
             resp.raise_for_status()
             data = resp.json()
             self._record_success()
-            return data["data"][0]["embedding"]
+            return self._adjust_dim(data["data"][0]["embedding"])
         except Exception as exc:
             self._record_failure(exc)
             logger.warning("NV-Embed text embed failed: %s", exc)
@@ -226,7 +238,7 @@ class NvidiaProvider:
             resp.raise_for_status()
             data = resp.json()
             self._record_success()
-            return [item["embedding"] for item in data["data"]]
+            return [self._adjust_dim(item["embedding"]) for item in data["data"]]
         except Exception as exc:
             self._record_failure(exc)
             logger.warning("NV-Embed batch embed failed: %s", exc)
